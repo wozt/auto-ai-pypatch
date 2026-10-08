@@ -13,6 +13,8 @@ typedef struct {
     gboolean numbering;
     gboolean automatic;
     gboolean git_enabled;
+    /* In a dirty repo, manually run Python; never auto-stage or auto-push. */
+    gboolean allow_dirty_manual;
     gboolean delete_after_success;
     guint max_age;
     guint auto_limit;

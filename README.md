@@ -162,3 +162,13 @@ Le test Git utilise un dépôt bare local temporaire ; il ne pousse **rien sur G
 - L'enregistrement demeure **avant** le lancement Python : en cas d'échec/crash du script,
   une nouvelle confirmation reste obligatoire. Une erreur d'en-tête n'inscrit plus de tentative.
 
+
+## Patch 006 — dépôts modifiés : repli manuel sûr
+
+- Nouveau réglage (désactivé par défaut) : « Dépôt Git modifié : autoriser Python manuel (Git à faire soi-même) ».
+- Avec Git coché et dépôt **propre**, comportement identique : Python, puis commit/push automatique.
+- Avec Git coché et dépôt **modifié**, le bouton **Apply patch** peut exécuter Python ; `git add/commit/push` est **désactivé pour cette exécution**, même si Git est coché. Le téléchargement est conservé.
+- L'exécution *automatique* reste interdite si le dépôt est modifié. Le clic manuel est nécessaire ; jamais de `git add -A` sur un dépôt déjà sale.
+- La racine du dépôt, l'upstream et la synchronisation de branche restent obligatoires, même en mode manuel ; les métadonnées d'en-tête sont toujours vérifiées.
+- Après succès Python, contrôler `git status` et `git diff`, puis sélectionner/committer/pousser manuellement. Le script est mémorisé comme appliqué ; ne pas le relancer pour résoudre Git.
+- Le mode `Git add/commit/push` automatique sélectif pour dépôts déjà sales **n'est pas encore implémenté**. Ce mode de repli privilégie l'absence de commits accidentels.

@@ -35,7 +35,9 @@ static gboolean git_local(const char *directory, const char *const args[],
     return TRUE;
 }
 
-gboolean aa_git_preflight(const char *directory, GError **error) {
+gboolean aa_git_preflight_mode(const char *directory, gboolean allow_dirty,
+                               gboolean *is_dirty, GError **error) {
+    if (is_dirty) *is_dirty = FALSE;
     g_autofree char *root = NULL;
     const char *const root_args[] = {"rev-parse", "--show-toplevel", NULL};
     if (!git_local(directory, root_args, &root, error)) return FALSE;
@@ -65,11 +67,19 @@ gboolean aa_git_preflight(const char *directory, GError **error) {
     const char *const status_args[] = {"status", "--porcelain=v1", "--untracked-files=all", NULL};
     if (!git_local(directory, status_args, &status, error)) return FALSE;
     if (status && *status) {
+        if (allow_dirty) {
+            if (is_dirty) *is_dirty = TRUE;
+            return TRUE;
+        }
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
            "Dépôt Git non propre (modifications ou fichiers non suivis) : commit/stash ou .gitignore avant Apply patch.");
         return FALSE;
     }
     return TRUE;
+}
+
+gboolean aa_git_preflight(const char *directory, GError **error) {
+    return aa_git_preflight_mode(directory, FALSE, NULL, error);
 }
 
 static void git_free(AaGit *g) {

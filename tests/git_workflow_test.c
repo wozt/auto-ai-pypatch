@@ -80,10 +80,22 @@ static void test_git_flow(void) {
     g_autoptr(GError) error = NULL;
     g_assert_true(aa_git_preflight(work, &error));
     g_assert_no_error(error);
+    gboolean dirty = TRUE;
+    g_assert_true(aa_git_preflight_mode(work, TRUE, &dirty, &error));
+    g_assert_false(dirty);
     write_file(file, "updated\n");
     g_assert_false(aa_git_preflight(work, &error));
     g_assert_nonnull(error);
     g_clear_error(&error);
+    g_assert_true(aa_git_preflight_mode(work, TRUE, &dirty, &error));
+    g_assert_no_error(error);
+    g_assert_true(dirty);
+    /* Non-tracked files also select manual Git mode. */
+    g_autofree char *extra = g_build_filename(work, "untracked.txt", NULL);
+    write_file(extra, "local-only\n");
+    g_assert_true(aa_git_preflight_mode(work, TRUE, &dirty, &error));
+    g_assert_true(dirty);
+    g_assert_cmpint(g_remove(extra), ==, 0);
     GitResult result = {.loop = g_main_loop_new(NULL, FALSE)};
     AaGit *job = aa_git_start(work, "fix: update file", on_output, git_done, &result, &error);
     g_assert_nonnull(job);
@@ -109,6 +121,10 @@ static void test_git_flow(void) {
     g_assert_false(result.ok);
     g_main_loop_unref(result.loop);
     g_assert_false(aa_git_preflight(work, &error)); /* Branch is ahead. */
+    g_clear_error(&error);
+    /* Dirty override cannot bypass the upstream alignment requirement. */
+    g_assert_false(aa_git_preflight_mode(work, TRUE, &dirty, &error));
+    g_assert_nonnull(error);
     g_clear_error(&error);
     /* Temp fixture left for OS cleanup, not part of the actual repository. */
 }

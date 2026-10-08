@@ -34,6 +34,7 @@ typedef struct {
     guint64 running_number;
     guint auto_success_count;
     gboolean running_automatic;
+    gboolean running_git_manual; /* Dirty worktree: never auto-stage or delete. */
     gboolean closing;
     guint scan_source;
     char *last_problem;
@@ -46,7 +47,7 @@ typedef struct {
     GtkWidget *watch_entry, *project_entry, *regex_entry, *prefix_entry;
     GtkWidget *suffix_entry, *extension_entry, *number_regex_entry;
     GtkWidget *age_spin, *limit_spin, *numbering_switch;
-    GtkWidget *auto_switch, *git_switch, *delete_switch, *language;
+    GtkWidget *auto_switch, *git_switch, *dirty_switch, *delete_switch, *language;
     GtkWidget *preview, *preview_extra, *number_examples;
 } Ui;
 
@@ -167,6 +168,7 @@ static void collect(Ui *u) {
     u->config.numbering = gtk_switch_get_active(GTK_SWITCH(u->numbering_switch));
     u->config.automatic = gtk_switch_get_active(GTK_SWITCH(u->auto_switch));
     u->config.git_enabled = gtk_switch_get_active(GTK_SWITCH(u->git_switch));
+    u->config.allow_dirty_manual = gtk_switch_get_active(GTK_SWITCH(u->dirty_switch));
     u->config.delete_after_success = gtk_switch_get_active(GTK_SWITCH(u->delete_switch));
     u->config.max_age = (guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(u->age_spin));
     u->config.auto_limit = (guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(u->limit_spin));
@@ -464,13 +466,27 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
         return;
     }
     aa_candidate_result_clear(&check);
-    if (u->config.git_enabled && !aa_git_preflight(u->config.project_dir, &error)) {
+    gboolean git_manual = FALSE;
+    if (u->config.git_enabled &&
+        !aa_git_preflight_mode(u->config.project_dir, u->config.allow_dirty_manual,
+                               &git_manual, &error)) {
         g_autofree char *msg = g_strdup_printf("Git : préconditions non satisfaites, aucun Python lancé : %s",
                                                error ? error->message : "état inconnu");
         aa_log_append(u->journal, msg);
-        stop_watcher(u); /* No accidental auto-retries if Git worktree is dirty. */
+        stop_watcher(u);
         return;
     }
+    if (git_manual && automatic) {
+        aa_log_append(u->journal,
+            "Dépôt Git modifié : aucun lancement automatique autorisé. "
+            "Arrête la surveillance, vérifie les changements et clique Apply patch.");
+        stop_watcher(u);
+        return;
+    }
+    if (git_manual) aa_log_append(u->journal,
+        "Git : dépôt déjà modifié. Python manuel uniquement ; aucun Git add/commit/push automatique, "
+        "aucune suppression du téléchargement. Vérifie git diff après le patch.");
+    u->running_git_manual = git_manual;
     /* History is saved by the executor callback after snapshot/header validation. */
     u->running_name = g_strdup(filename);
     u->running_number = number;
@@ -483,6 +499,7 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
         g_autofree gchar *msg = g_strdup_printf("Démarrage Python refusé : %s", error->message);
         aa_log_append(u->journal, msg);
         g_clear_pointer(&u->running_name, g_free);
+        u->running_git_manual = FALSE;
         stop_watcher(u); /* Prevent repeated failures; invalid metadata left history untouched. */
         return;
     }
@@ -498,6 +515,7 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
 
 static void finish_operation(Ui *u, gboolean success) {
     g_clear_pointer(&u->running_name, g_free);
+    u->running_git_manual = FALSE;
     aa_source_receipt_free(u->git_receipt);
     u->git_receipt = NULL;
     gtk_widget_set_sensitive(u->cancel_button, FALSE);
@@ -565,6 +583,13 @@ static void on_executor_finished(gboolean success, int exit_code, const char *me
             g_autofree char *problem = g_strdup_printf("Historique d'application NON enregistré : %s", error->message);
             aa_log_append(u->journal, problem);
             success = FALSE;
+        } else if (u->config.git_enabled && u->running_git_manual) {
+            /* A dirty baseline cannot be safely separated with `git add -A`.
+             * Leave the worktree and the downloaded patch for manual review. */
+            aa_log_append(u->journal,
+                "PYTHON SUCCÈS (dépôt modifié) : Git automatique ignoré. "
+                "Contrôle git status/diff, puis commit/push manuellement. "
+                "Téléchargement conservé même si suppression activée.");
         } else if (u->config.git_enabled && !u->closing) {
             g_autofree char *commit_message = g_strdup(aa_executor_commit_message(completed));
             if (u->config.delete_after_success) {
@@ -779,7 +804,10 @@ static void on_start(GtkButton *button, gpointer data) {
     Ui *u = data;
     if (u->watcher) {
         stop_watcher(u);
-        aa_log_append(u->journal, "Surveillance arrêtée. Le script en cours continue : utilise Interrompre si nécessaire.");
+        aa_log_append(u->journal,
+            (u->executor || u->git_job)
+            ? "Surveillance arrêtée ; l'opération en cours continue (Interrompre pour l'arrêter)."
+            : "Surveillance arrêtée.");
         return;
     }
     if (u->executor || u->git_job || u->pending_name) return;
@@ -817,7 +845,9 @@ static void on_start(GtkButton *button, gpointer data) {
         u->config.automatic ? "Mode AUTOMATIQUE : Python peut modifier le projet sans validation."
                             : "Mode MANUEL : confirmation avant chaque exécution Python.");
     if (u->config.git_enabled) aa_log_append(u->journal,
-        "Git activé : dépôt propre et upstream obligatoires, commit/push après succès Python.");
+        u->config.allow_dirty_manual
+        ? "Git : dépôt propre = commit/push auto ; dépôt modifié = Python manuel, Git manuel."
+        : "Git activé : dépôt propre et upstream obligatoires, commit/push après succès Python.");
     schedule_scan(u); /* Also inspect files that arrived just before Start. */
     schedule_candidate_refresh(u);
 }
@@ -990,6 +1020,12 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     u->git_switch = switch_row(settings, "Git add / commit / push automatique", u->config.git_enabled);
     gtk_widget_set_tooltip_text(u->git_switch,
         "Exige une racine Git propre, une branche upstream et des métadonnées valides dans le script.");
+    u->dirty_switch = switch_row(settings,
+        "Dépôt Git modifié : autoriser Python manuel (Git à faire soi-même)",
+        u->config.allow_dirty_manual);
+    gtk_widget_set_tooltip_text(u->dirty_switch,
+        "Avec Git activé et un dépôt sale : autorise Apply patch uniquement en manuel. "
+        "Ne fait aucun add/commit/push et conserve le script, même si la suppression est cochée.");
     u->delete_switch = switch_row(settings, "Supprimer le patch après exécution réussie", u->config.delete_after_success);
     gtk_widget_set_tooltip_text(u->delete_switch,
         "Sans Git : après succès Python et historique. Avec Git : seulement après push réussi.");
