@@ -23,3 +23,18 @@ void aa_executor_cancel(AaExecutor *executor);
  * Uses best-effort identity validation, not atomic conditional unlink.
  */
 gboolean aa_executor_remove_source(AaExecutor *executor, GError **error);
+
+/* Optional metadata requirement: Git mode refuses scripts without project/commit headers
+ * BEFORE launching Python. Existing start() remains compatible with non-Git tests. */
+AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basename,
+                        const char *project_dir, gboolean git_enabled,
+                        AaExecutorOutput output, AaExecutorFinished finished,
+                        gpointer data, GError **error);
+const char *aa_executor_commit_message(const AaExecutor *executor);
+
+typedef struct AaSourceReceipt AaSourceReceipt;
+/* Snapshot file identity survives destruction of the Python executor, allowing
+ * deletion only AFTER async Git push success. */
+AaSourceReceipt *aa_executor_receipt(const AaExecutor *executor);
+gboolean aa_source_receipt_remove(AaSourceReceipt *receipt, GError **error);
+void aa_source_receipt_free(AaSourceReceipt *receipt);

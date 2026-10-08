@@ -6,6 +6,7 @@
 #include "candidate.h"
 #include "history.h"
 #include "executor.h"
+#include "git.h"
 #include "log.h"
 #include <gio/gio.h>
 
@@ -14,6 +15,8 @@ typedef struct {
     AaWatcher *watcher;
     AaHistory *history;
     AaExecutor *executor;
+    AaGit *git_job;
+    AaSourceReceipt *git_receipt;
     GtkWidget *cancel_button;
     GtkWidget *apply_button;
     GtkWidget *candidate_label;
@@ -53,6 +56,7 @@ static void refresh_candidate(Ui *u);
 static void schedule_candidate_refresh(Ui *u);
 static void reset_preview_monitor(Ui *u);
 static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data);
+static void on_git_finished(gboolean success, const char *message, gpointer data);
 
 static GtkWidget *entry_row(GtkWidget *parent, const char *label, const char *value) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -249,7 +253,7 @@ static void candidate_markup(Ui *u, const char *color, const char *message,
     gtk_label_set_markup(GTK_LABEL(u->candidate_label), markup);
     gtk_widget_set_sensitive(u->apply_button,
         can_apply && g_file_test(u->config.project_dir, G_FILE_TEST_IS_DIR) &&
-        !u->executor && !u->pending_name && !u->closing);
+        !u->executor && !u->git_job && !u->pending_name && !u->closing);
 }
 
 static void refresh_candidate(Ui *u) {
@@ -258,7 +262,7 @@ static void refresh_candidate(Ui *u) {
         g_source_remove(u->expiry_source);
         u->expiry_source = 0;
     }
-    if (u->executor || u->pending_name) {
+    if (u->executor || u->git_job || u->pending_name) {
         candidate_markup(u, "#729fcf", u->running_name ? u->running_name : "confirmation en attente", FALSE);
         return;
     }
@@ -429,7 +433,7 @@ static void executor_output(const char *line, gboolean is_stderr, gpointer data)
 
 static void execute_selected(Ui *u, const char *filename, guint64 number,
                              gboolean automatic, gboolean allow_expired) {
-    if (!u->history || u->executor || u->closing || (automatic && !u->watcher)) return;
+    if (!u->history || u->executor || u->git_job || u->closing || (automatic && !u->watcher)) return;
     /* Rescan at approval time: a second file may have arrived while the dialog was open. */
     AaCandidateResult check = {0};
     g_autoptr(GError) error = NULL;
@@ -451,6 +455,13 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
         return;
     }
     aa_candidate_result_clear(&check);
+    if (u->config.git_enabled && !aa_git_preflight(u->config.project_dir, &error)) {
+        g_autofree char *msg = g_strdup_printf("Git : préconditions non satisfaites, aucun Python lancé : %s",
+                                               error ? error->message : "état inconnu");
+        aa_log_append(u->journal, msg);
+        stop_watcher(u); /* No accidental auto-retries if Git worktree is dirty. */
+        return;
+    }
     if (!aa_history_record_attempt(u->history, filename, &error)) {
         g_autofree gchar *msg = g_strdup_printf("Impossible de sécuriser l'historique : %s", error->message);
         log_problem(u, msg);
@@ -460,7 +471,8 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
     u->running_name = g_strdup(filename);
     u->running_number = number;
     u->running_automatic = automatic;
-    u->executor = aa_executor_start(u->config.watch_dir, filename, u->config.project_dir,
+    u->executor = aa_executor_start_checked(u->config.watch_dir, filename, u->config.project_dir,
+                                    u->config.git_enabled,
                                     executor_output, on_executor_finished, u, &error);
     if (!u->executor) {
         g_autofree gchar *msg = g_strdup_printf("Démarrage Python refusé : %s", error->message);
@@ -479,45 +491,16 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
     gtk_widget_set_sensitive(u->start_button, TRUE); /* Stop only stops file detection. */
 }
 
-static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data) {
-    Ui *u = data;
-    AaExecutor *completed = u->executor; /* Valid only until this callback returns. */
-    u->executor = NULL; /* Executor destroys itself after this callback returns. */
-    gtk_widget_set_sensitive(u->cancel_button, FALSE);
-    gtk_widget_set_sensitive(u->settings_box, !u->watcher);
-    g_autofree gchar *msg = g_strdup_printf("%s : %s", success ? "SUCCÈS" : "ÉCHEC", message);
-    aa_log_append(u->journal, msg);
-    if (success && u->history) {
-        g_autoptr(GError) error = NULL;
-        if (!aa_history_record_applied(u->history, u->running_name,
-                                       u->config.numbering, u->running_number, &error)) {
-            g_autofree gchar *failure = g_strdup_printf("Historique d'application NON enregistré : %s", error->message);
-            aa_log_append(u->journal, failure);
-            success = FALSE;
-        } else {
-            if (u->running_automatic && u->auto_success_count < G_MAXUINT)
-                u->auto_success_count++;
-            /* Only remove the downloaded source after durable applied history.
-               A replaced or modified file is NEVER intentionally deleted. */
-            if (u->config.delete_after_success && completed) {
-                g_autoptr(GError) remove_error = NULL;
-                if (aa_executor_remove_source(completed, &remove_error)) {
-                    g_autofree gchar *removed = g_strdup_printf(
-                        "Patch téléchargé supprimé après succès : %s", u->running_name);
-                    aa_log_append(u->journal, removed);
-                } else {
-                    g_autofree gchar *warning = g_strdup_printf(
-                        "Patch appliqué, mais source conservée : %s",
-                        remove_error ? remove_error->message : "suppression refusée");
-                    aa_log_append(u->journal, warning);
-                }
-            }
-        }
-    }
+static void finish_operation(Ui *u, gboolean success) {
     g_clear_pointer(&u->running_name, g_free);
+    aa_source_receipt_free(u->git_receipt);
+    u->git_receipt = NULL;
+    gtk_widget_set_sensitive(u->cancel_button, FALSE);
     if (!success || u->closing) {
-        stop_watcher(u); /* Never retry a failed/unknown patch automatically. */
-        if (!u->closing) aa_log_append(u->journal, "Surveillance arrêtée après échec ; nouvel essai = confirmation obligatoire.");
+        stop_watcher(u);
+        if (!u->closing) aa_log_append(u->journal,
+            "Surveillance arrêtée après échec : Python ne sera pas rejoué automatiquement. "
+            "En cas d'échec Git, termine commit/push manuellement.");
     } else if (u->watcher) {
         gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (exécution disponible)");
         schedule_scan(u);
@@ -529,6 +512,90 @@ static void on_executor_finished(gboolean success, int exit_code, const char *me
     if (!u->closing && !u->watcher) gtk_widget_set_sensitive(u->settings_box, TRUE);
     if (u->closing) gtk_window_destroy(GTK_WINDOW(u->window));
     else schedule_candidate_refresh(u);
+}
+
+static void git_output(const char *line, gpointer data) {
+    Ui *u = data;
+    g_autofree char *msg = g_strdup_printf("GIT | %s", line);
+    aa_log_append(u->journal, msg);
+}
+
+static void on_git_finished(gboolean success, const char *message, gpointer data) {
+    Ui *u = data;
+    u->git_job = NULL; /* Async runner frees itself after callback. */
+    g_autofree char *msg = g_strdup_printf("%s : %s",
+        success ? "GIT SUCCÈS" : "GIT ÉCHEC", message);
+    aa_log_append(u->journal, msg);
+    if (success && !u->closing) {
+        if (u->running_automatic && u->auto_success_count < G_MAXUINT) u->auto_success_count++;
+        if (u->config.delete_after_success && u->git_receipt) {
+            g_autoptr(GError) error = NULL;
+            if (aa_source_receipt_remove(u->git_receipt, &error))
+                aa_log_append(u->journal, "Patch téléchargé supprimé après Git push réussi.");
+            else {
+                g_autofree char *warning = g_strdup_printf("Patch appliqué et poussé, source conservée : %s",
+                    error ? error->message : "vérification du fichier refusée");
+                aa_log_append(u->journal, warning);
+            }
+        }
+    } else if (!success) {
+        aa_log_append(u->journal,
+            "Python avait réussi et figure dans l'historique. Ne le réexécute pas ; "
+            "vérifie l'état Git et relance seulement commit/push si nécessaire.");
+    }
+    finish_operation(u, success);
+}
+
+static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data) {
+    Ui *u = data;
+    AaExecutor *completed = u->executor; /* Borrowed until callback returns. */
+    u->executor = NULL;
+    gtk_widget_set_sensitive(u->cancel_button, FALSE);
+    g_autofree char *msg = g_strdup_printf("%s : %s", success ? "PYTHON SUCCÈS" : "PYTHON ÉCHEC", message);
+    aa_log_append(u->journal, msg);
+    if (success && u->history) {
+        g_autoptr(GError) error = NULL;
+        if (!aa_history_record_applied(u->history, u->running_name,
+                                       u->config.numbering, u->running_number, &error)) {
+            g_autofree char *problem = g_strdup_printf("Historique d'application NON enregistré : %s", error->message);
+            aa_log_append(u->journal, problem);
+            success = FALSE;
+        } else if (u->config.git_enabled && !u->closing) {
+            g_autofree char *commit_message = g_strdup(aa_executor_commit_message(completed));
+            if (u->config.delete_after_success) {
+                u->git_receipt = aa_executor_receipt(completed);
+                if (!u->git_receipt) aa_log_append(u->journal,
+                    "Impossible de conserver l'identité du téléchargement : suppression après Git désactivée pour ce patch.");
+            }
+            u->git_job = aa_git_start(u->config.project_dir, commit_message,
+                                       git_output, on_git_finished, u, &error);
+            if (!u->git_job) {
+                g_autofree char *problem = g_strdup_printf("Impossible de démarrer Git : %s",
+                                                            error ? error->message : "erreur inconnue");
+                aa_log_append(u->journal, problem);
+                success = FALSE;
+            } else {
+                gtk_widget_set_sensitive(u->cancel_button, TRUE);
+                gtk_widget_set_sensitive(u->settings_box, FALSE);
+                gtk_label_set_text(GTK_LABEL(u->status), "Git add / commit / push en cours…");
+                return; /* Git callback resumes lifecycle asynchronously. */
+            }
+        } else {
+            if (u->running_automatic && u->auto_success_count < G_MAXUINT)
+                u->auto_success_count++;
+            if (u->config.delete_after_success && completed && !u->closing) {
+                g_autoptr(GError) remove_error = NULL;
+                if (aa_executor_remove_source(completed, &remove_error))
+                    aa_log_append(u->journal, "Patch téléchargé supprimé après succès Python.");
+                else {
+                    g_autofree char *warning = g_strdup_printf("Patch appliqué, source conservée : %s",
+                        remove_error ? remove_error->message : "suppression refusée");
+                    aa_log_append(u->journal, warning);
+                }
+            }
+        }
+    }
+    finish_operation(u, success);
     (void)exit_code;
 }
 
@@ -568,7 +635,7 @@ static void on_decision(GObject *source, GAsyncResult *result, gpointer data) {
 static void request_approval(Ui *u, const char *filename, guint64 number,
                              gboolean quota_reached, gboolean previous_attempt,
                              gboolean from_button, gboolean allow_expired) {
-    if (u->pending_name || u->executor) return;
+    if (u->pending_name || u->executor || u->git_job) return;
     u->pending_name = g_strdup(filename);
     u->pending_number = number;
     u->pending_from_button = from_button;
@@ -598,7 +665,7 @@ static void request_approval(Ui *u, const char *filename, guint64 number,
 static void on_apply_patch(GtkButton *button, gpointer data) {
     (void)button;
     Ui *u = data;
-    if (u->closing || u->executor || u->pending_name) return;
+    if (u->closing || u->executor || u->git_job || u->pending_name) return;
     collect(u);
     g_autoptr(GError) error = NULL;
     if (!aa_matcher_validate(&u->config, &error) ||
@@ -642,7 +709,7 @@ static void on_apply_patch(GtkButton *button, gpointer data) {
 static gboolean scan_candidates(gpointer data) {
     Ui *u = data;
     u->scan_source = 0;
-    if (!u->watcher || !u->history || u->executor || u->pending_name || u->closing) return G_SOURCE_REMOVE;
+    if (!u->watcher || !u->history || u->executor || u->git_job || u->pending_name || u->closing) return G_SOURCE_REMOVE;
     AaCandidateResult result = {0};
     g_autoptr(GError) error = NULL;
     if (!aa_candidate_scan(&u->config, u->history, &result, &error)) {
@@ -691,12 +758,12 @@ static void stop_watcher(Ui *u) {
         aa_watcher_stop(u->watcher);
         u->watcher = NULL;
     }
-    if (!u->executor && !u->pending_from_button) {
+    if (!u->executor && !u->git_job && !u->pending_from_button) {
         aa_history_free(u->history);
         u->history = NULL;
     }
     g_clear_pointer(&u->last_problem, g_free);
-    if (!u->executor) gtk_widget_set_sensitive(u->settings_box, TRUE);
+    if (!u->executor && !u->git_job) gtk_widget_set_sensitive(u->settings_box, TRUE);
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Démarrer");
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance arrêtée");
     schedule_candidate_refresh(u);
@@ -710,7 +777,7 @@ static void on_start(GtkButton *button, gpointer data) {
         aa_log_append(u->journal, "Surveillance arrêtée. Le script en cours continue : utilise Interrompre si nécessaire.");
         return;
     }
-    if (u->executor || u->pending_name) return;
+    if (u->executor || u->git_job || u->pending_name) return;
     collect(u);
     g_autoptr(GError) error = NULL;
     if (!aa_matcher_validate(&u->config, &error)) {
@@ -742,8 +809,10 @@ static void on_start(GtkButton *button, gpointer data) {
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (exécution disponible)");
     u->auto_success_count = 0;
     aa_log_append(u->journal,
-        u->config.automatic ? "Mode AUTOMATIQUE activé : Python peut modifier ton projet sans validation, Git inactif."
-                            : "Mode MANUEL : confirmation avant chaque exécution Python, Git inactif.");
+        u->config.automatic ? "Mode AUTOMATIQUE : Python peut modifier le projet sans validation."
+                            : "Mode MANUEL : confirmation avant chaque exécution Python.");
+    if (u->config.git_enabled) aa_log_append(u->journal,
+        "Git activé : dépôt propre et upstream obligatoires, commit/push après succès Python.");
     schedule_scan(u); /* Also inspect files that arrived just before Start. */
     schedule_candidate_refresh(u);
 }
@@ -754,17 +823,21 @@ static void on_cancel_running(GtkButton *button, gpointer data) {
     if (u->executor) {
         aa_log_append(u->journal, "Interruption demandée : processus Python arrêté.");
         aa_executor_cancel(u->executor);
+    } else if (u->git_job) {
+        aa_log_append(u->journal, "Interruption demandée : Git arrêté (commit local éventuellement créé).");
+        aa_git_cancel(u->git_job);
     }
 }
 
 static gboolean on_close(GtkWindow *window, gpointer data) {
     (void)window;
     Ui *u = data;
-    if (u->executor || u->pending_name) {
+    if (u->executor || u->git_job || u->pending_name) {
         u->closing = TRUE;
         stop_watcher(u);
         if (u->decision_cancel) g_cancellable_cancel(u->decision_cancel);
         if (u->executor) aa_executor_cancel(u->executor);
+        if (u->git_job) aa_git_cancel(u->git_job);
         return TRUE; /* Keep the UI alive until async callbacks have completed. */
     }
     stop_watcher(u);
@@ -786,6 +859,7 @@ static gboolean on_close(GtkWindow *window, gpointer data) {
     g_signal_handlers_disconnect_by_data(u->language, u);
     g_autoptr(GError) error = NULL;
     if (!aa_config_save(&u->config, &error)) g_warning("Config save: %s", error->message);
+    aa_source_receipt_free(u->git_receipt);
     aa_config_clear(&u->config);
     g_free(u);
     return FALSE; /* Allow GTK4 to close the window. */
@@ -833,7 +907,7 @@ GtkWidget *aa_window_new(AdwApplication *app) {
         "Applique manuellement le fichier détecté, même si la surveillance est arrêtée.");
     gtk_box_append(GTK_BOX(toolbar), u->apply_button);
     g_signal_connect(u->apply_button, "clicked", G_CALLBACK(on_apply_patch), u);
-    u->cancel_button = gtk_button_new_with_label("Interrompre Python");
+    u->cancel_button = gtk_button_new_with_label("Interrompre Python/Git");
     gtk_widget_set_sensitive(u->cancel_button, FALSE);
     gtk_box_append(GTK_BOX(toolbar), u->cancel_button);
     g_signal_connect(u->cancel_button, "clicked", G_CALLBACK(on_cancel_running), u);
@@ -908,11 +982,12 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     u->auto_switch = switch_row(settings, "Exécution automatique (code non isolé)", u->config.automatic);
     gtk_widget_set_tooltip_text(u->auto_switch,
         "ATTENTION : ces scripts Python disposent de tous les droits de ton compte utilisateur.");
-    u->git_switch = switch_row(settings, "Git add/commit/push (patch 005)", u->config.git_enabled);
+    u->git_switch = switch_row(settings, "Git add / commit / push automatique", u->config.git_enabled);
+    gtk_widget_set_tooltip_text(u->git_switch,
+        "Exige une racine Git propre, une branche upstream et des métadonnées valides dans le script.");
     u->delete_switch = switch_row(settings, "Supprimer le patch après exécution réussie", u->config.delete_after_success);
     gtk_widget_set_tooltip_text(u->delete_switch,
-        "Option désactivée par défaut. Ne supprime que le fichier téléchargé inchangé après Python exit 0 et sauvegarde de l'historique.");
-    gtk_widget_set_sensitive(u->git_switch, FALSE);
+        "Sans Git : après succès Python et historique. Avec Git : seulement après push réussi.");
 
     GtkWidget *right_scroll = gtk_scrolled_window_new();
     gtk_paned_set_end_child(GTK_PANED(paned), right_scroll);

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "executor.h"
+#include "patch_meta.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -29,6 +30,7 @@ struct AaExecutor {
     int watch_fd; /* Pin watched directory across execution, including symlinked folders. */
     gchar *source_basename;
     gchar *source_sha256;
+    gchar *commit_message;
     struct stat source_stat;
     gboolean wait_done;
     gboolean wait_ok;
@@ -49,6 +51,7 @@ static void executor_free(AaExecutor *e) {
     g_free(e->stage_dir);
     g_free(e->source_basename);
     g_free(e->source_sha256);
+    g_free(e->commit_message);
     g_free(e);
 }
 
@@ -192,9 +195,10 @@ static gboolean copy_snapshot(AaExecutor *e, const char *watch_dir,
                                     contents->len, G_FILE_SET_CONTENTS_CONSISTENT, 0600, error);
 }
 
-AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
-                              const char *project_dir, AaExecutorOutput output,
-                              AaExecutorFinished finished, gpointer data, GError **error) {
+AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basename,
+                              const char *project_dir, gboolean git_enabled,
+                              AaExecutorOutput output, AaExecutorFinished finished,
+                              gpointer data, GError **error) {
     if (!project_dir || !g_file_test(project_dir, G_FILE_TEST_IS_DIR)) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY, "Dossier projet inexistant.");
         return NULL;
@@ -207,6 +211,10 @@ AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
     if (!copy_snapshot(e, watch_dir, basename, error)) {
         executor_free(e);
         return NULL;
+    }
+    if (git_enabled) {
+        e->commit_message = aa_patch_meta_read(e->stage_file, project_dir, error);
+        if (!e->commit_message) { executor_free(e); return NULL; }
     }
     g_autoptr(GSubprocessLauncher) launcher = g_subprocess_launcher_new(
         G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
@@ -224,6 +232,44 @@ AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
     schedule_read(&e->stderr_stream);
     g_subprocess_wait_async(e->process, NULL, wait_finished, e);
     return e;
+}
+
+AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
+                             const char *project_dir, AaExecutorOutput output,
+                             AaExecutorFinished finished, gpointer data, GError **error) {
+    return aa_executor_start_checked(watch_dir, basename, project_dir, FALSE,
+                                     output, finished, data, error);
+}
+
+const char *aa_executor_commit_message(const AaExecutor *e) {
+    return e ? e->commit_message : NULL;
+}
+
+struct AaSourceReceipt {
+    int watch_fd;
+    char *basename;
+    char *sha256;
+    struct stat source_stat;
+};
+
+AaSourceReceipt *aa_executor_receipt(const AaExecutor *e) {
+    if (!e || !e->wait_done || !e->wait_ok || e->interrupted || e->exit_code != 0 ||
+        !g_subprocess_get_if_exited(e->process) || e->watch_fd < 0) return NULL;
+    int copy_fd = dup(e->watch_fd);
+    if (copy_fd < 0) return NULL;
+    AaSourceReceipt *r = g_new0(AaSourceReceipt, 1);
+    r->watch_fd = copy_fd;
+    r->basename = g_strdup(e->source_basename);
+    r->sha256 = g_strdup(e->source_sha256);
+    r->source_stat = e->source_stat;
+    return r;
+}
+void aa_source_receipt_free(AaSourceReceipt *r) {
+    if (!r) return;
+    if (r->watch_fd >= 0) close(r->watch_fd);
+    g_free(r->basename);
+    g_free(r->sha256);
+    g_free(r);
 }
 
 void aa_executor_cancel(AaExecutor *e) {
@@ -246,16 +292,10 @@ static gboolean source_stat_matches(const struct stat *saved, const struct stat 
         saved->st_ctim.tv_nsec == now->st_ctim.tv_nsec;
 }
 
-gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
-    g_return_val_if_fail(e != NULL, FALSE);
-    if (e->watch_fd < 0 || !e->source_basename || !e->source_sha256 ||
-        !e->wait_done || !e->wait_ok || e->interrupted || e->exit_code != 0 ||
-        !g_subprocess_get_if_exited(e->process)) {
-        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            "Suppression refusée : aucune exécution Python réussie.");
-        return FALSE;
-    }
-    int fd = openat(e->watch_fd, e->source_basename,
+static gboolean remove_source_checked(int watch_fd, const char *source_basename,
+                                      const char *source_sha256,
+                                      const struct stat *source_stat, GError **error) {
+    int fd = openat(watch_fd, source_basename,
                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
@@ -264,7 +304,7 @@ gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
     }
     struct stat before, after, path_stat;
     gboolean unchanged = fstat(fd, &before) == 0 &&
-        source_stat_matches(&e->source_stat, &before);
+        source_stat_matches(source_stat, &before);
     GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
     gsize total = 0;
     guint8 chunk[16384];
@@ -274,17 +314,17 @@ gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
         if (n < 0) { unchanged = FALSE; break; }
         if (n == 0) break;
         total += (gsize)n;
-        if (total > AA_MAX_PATCH_BYTES || total > (gsize)e->source_stat.st_size) {
+        if (total > AA_MAX_PATCH_BYTES || total > (gsize)source_stat->st_size) {
             unchanged = FALSE;
             break;
         }
         g_checksum_update(checksum, chunk, (gsize)n);
     }
-    unchanged = unchanged && total == (gsize)e->source_stat.st_size &&
-        g_strcmp0(g_checksum_get_string(checksum), e->source_sha256) == 0 &&
-        fstat(fd, &after) == 0 && source_stat_matches(&e->source_stat, &after) &&
-        fstatat(e->watch_fd, e->source_basename, &path_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
-        source_stat_matches(&e->source_stat, &path_stat);
+    unchanged = unchanged && total == (gsize)source_stat->st_size &&
+        g_strcmp0(g_checksum_get_string(checksum), source_sha256) == 0 &&
+        fstat(fd, &after) == 0 && source_stat_matches(source_stat, &after) &&
+        fstatat(watch_fd, source_basename, &path_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+        source_stat_matches(source_stat, &path_stat);
     g_checksum_free(checksum);
     close(fd);
     if (!unchanged) {
@@ -292,10 +332,31 @@ gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
             "Le fichier téléchargé a changé ou a été remplacé : suppression ignorée.");
         return FALSE;
     }
-    if (unlinkat(e->watch_fd, e->source_basename, 0) != 0) {
+    if (unlinkat(watch_fd, source_basename, 0) != 0) {
         g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
                     "Suppression du téléchargement impossible : %s", g_strerror(errno));
         return FALSE;
     }
     return TRUE;
+}
+
+gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
+    g_return_val_if_fail(e != NULL, FALSE);
+    if (e->watch_fd < 0 || !e->source_basename || !e->source_sha256 ||
+        !e->wait_done || !e->wait_ok || e->interrupted || e->exit_code != 0 ||
+        !g_subprocess_get_if_exited(e->process)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Suppression refusée : aucune exécution Python réussie.");
+        return FALSE;
+    }
+    return remove_source_checked(e->watch_fd, e->source_basename,
+                                 e->source_sha256, &e->source_stat, error);
+}
+gboolean aa_source_receipt_remove(AaSourceReceipt *r, GError **error) {
+    if (!r || r->watch_fd < 0 || !r->basename || !r->sha256) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Reçu de source invalide.");
+        return FALSE;
+    }
+    return remove_source_checked(r->watch_fd, r->basename, r->sha256,
+                                 &r->source_stat, error);
 }

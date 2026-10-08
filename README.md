@@ -111,3 +111,44 @@ L'aperçu affichera : `^patch_(?:[0-9]{4})_fix\.py$` (avec un seul antislash dan
 
 **Sécurité** : `Apply patch` lance du code Python avec les privilèges complets
 de l'utilisateur. Effectuer les premiers essais sur un dépôt jetable.
+
+
+## Phase 5 — Git automatique
+
+- Activation manuelle du switch **Git add / commit / push automatique** (désactivé par défaut).
+- Avant Python : exige que le **dossier projet soit la racine d'un dépôt Git propre**, sans
+  modifications, sans fichiers non suivis et avec une branche upstream synchronisée (`git push -u origin main`).
+  Pense à exclure `build/` dans le `.gitignore` de ton projet si nécessaire.
+- Au début du script Python, ajoute exactement :
+
+  ```python
+  # Auto-AI-PyPatch: commit-message: feat: describe changes
+  # Auto-AI-PyPatch: project: myproject
+  ```
+
+  Le marqueur `project` correspond au nom du dossier projet. Les deux marqueurs doivent
+  se trouver dans les premiers commentaires ; le message est limité à 200 caractères.
+  L'en-tête est lu **depuis le snapshot exécuté**, avant de lancer Python.
+- Après exit 0 Python et enregistrement de l'historique : `git add -A -- .`,
+  `git diff --cached --quiet --exit-code`, `git commit -m <message>` si changements,
+  puis `git push`. Ces commandes utilisent `GSubprocess` asynchrone, **sans shell**.
+- Pour éviter une demande interactive de mot de passe, le push désactive les invites
+  terminal/SSH. Configure préalablement ta clé SSH ou des credentials non interactifs.
+- Si Git échoue : le script est marqué comme **déjà appliqué** ; aucun Python automatique
+  ne recommence, aucun téléchargement n'est supprimé. Finalise le commit/push
+  **manuellement**, après examen de `git status`. Un commit local peut déjà exister.
+- Si l'option de suppression est active : sans Git, après Python+historique ;
+  avec Git, **seulement après push réussi** et vérification du fichier d'origine inchangé.
+- Limitations : les scripts Python ne sont **pas isolés**. `git add -A` stage toutes les
+  modifications présentes après le patch ; des changements concurrents pourraient
+  aussi être inclus. Utilise un dépôt dédié et évite les éditions simultanées.
+
+### Test
+
+```bash
+meson setup build --reconfigure
+meson compile -C build
+meson test -C build --print-errorlogs
+```
+
+Le test Git utilise un dépôt bare local temporaire ; il ne pousse **rien sur GitHub**.
