@@ -9,6 +9,7 @@ typedef struct {
     char *suffix;
     char *extension;
     char *language;
+    char *numbering_regex;
     gboolean numbering;
     gboolean automatic;
     gboolean git_enabled;

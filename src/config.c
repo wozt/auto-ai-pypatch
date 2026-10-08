@@ -16,6 +16,7 @@ void aa_config_init(AaConfig *c) {
     c->suffix = g_strdup("");
     c->extension = g_strdup(".py");
     c->language = g_strdup("fr");
+    c->numbering_regex = g_strdup("[0-9]{4}");
     c->max_age = 120;
     c->auto_limit = 1;
 }
@@ -28,6 +29,7 @@ void aa_config_clear(AaConfig *c) {
     g_clear_pointer(&c->suffix, g_free);
     g_clear_pointer(&c->extension, g_free);
     g_clear_pointer(&c->language, g_free);
+    g_clear_pointer(&c->numbering_regex, g_free);
 }
 
 static char *get_string(GKeyFile *key, const char *name, const char *fallback) {
@@ -54,6 +56,7 @@ gboolean aa_config_load(AaConfig *c, GError **error) {
     READ(watch_dir, "watch_dir"); READ(project_dir, "project_dir");
     READ(regex, "regex"); READ(prefix, "prefix"); READ(suffix, "suffix");
     READ(extension, "extension"); READ(language, "language");
+    READ(numbering_regex, "numbering_regex");
 #undef READ
     c->numbering = get_bool(key, "numbering", c->numbering);
     c->automatic = get_bool(key, "automatic", c->automatic);
@@ -69,6 +72,7 @@ gboolean aa_config_save(const AaConfig *c, GError **error) {
     WRITE(watch_dir, "watch_dir"); WRITE(project_dir, "project_dir");
     WRITE(regex, "regex"); WRITE(prefix, "prefix"); WRITE(suffix, "suffix");
     WRITE(extension, "extension"); WRITE(language, "language");
+    WRITE(numbering_regex, "numbering_regex");
 #undef WRITE
     g_key_file_set_boolean(key, "settings", "numbering", c->numbering);
     g_key_file_set_boolean(key, "settings", "automatic", c->automatic);

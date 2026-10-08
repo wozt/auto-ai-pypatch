@@ -1,7 +1,7 @@
 project('auto-ai-pypatch', 'c', version: '0.1.0', default_options: ['c_std=c11', 'warning_level=2'])
 
-gtk = dependency('gtk4', version: '>=4.6')
-adw = dependency('libadwaita-1', version: '>=1.2')
+gtk = dependency('gtk4', version: '>=4.10')
+adw = dependency('libadwaita-1', version: '>=1.4')
 gio = dependency('gio-2.0')
 
 sources = files(
