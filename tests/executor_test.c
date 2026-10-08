@@ -179,10 +179,91 @@ static void test_applied_history(void) {
     aa_config_clear(&cfg);
 }
 
+typedef struct {
+    GMainLoop *loop;
+    AaHistory *history;
+    guint attempted;
+    gboolean finished;
+    gboolean success;
+} HeaderTest;
+
+static gboolean header_record_attempt(gpointer data, GError **error) {
+    HeaderTest *t = data;
+    t->attempted++;
+    return aa_history_record_attempt(t->history, "patch_header.py", error);
+}
+static void header_finished(gboolean success, int exit_code,
+                            const char *message, gpointer data) {
+    (void)exit_code; (void)message;
+    HeaderTest *t = data;
+    t->finished = TRUE;
+    t->success = success;
+    g_main_loop_quit(t->loop);
+}
+static void test_header_before_attempt(void) {
+    g_autoptr(GError) error = NULL;
+    g_autofree char *root = g_dir_make_tmp("aap-header-order-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_autofree char *watch = g_build_filename(root, "watch", NULL);
+    g_autofree char *project = g_build_filename(root, "metroidvania", NULL);
+    g_assert_cmpint(g_mkdir(watch, 0700), ==, 0);
+    g_assert_cmpint(g_mkdir(project, 0700), ==, 0);
+    g_autofree char *file = g_build_filename(watch, "patch_header.py", NULL);
+    AaConfig config;
+    aa_config_init(&config);
+    g_free(config.watch_dir);
+    g_free(config.project_dir);
+    config.watch_dir = g_strdup(watch);
+    config.project_dir = g_strdup(project);
+    HeaderTest t = {.loop = g_main_loop_new(NULL, FALSE)};
+    t.history = aa_history_open_applied_at(&config, root, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(t.history);
+
+    g_assert_true(g_file_set_contents(file,
+        "# Auto-AI-PyPatch: commit-message: <feat: change>\n"
+        "# Auto-AI-PyPatch: project: project\nprint('wrong')\n", -1, NULL));
+    AaExecutor *e = aa_executor_start_checked_with_pre_spawn(
+        watch, "patch_header.py", project, TRUE, header_record_attempt,
+        NULL, header_finished, &t, &error);
+    g_assert_null(e);
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+    g_assert_cmpuint(t.attempted, ==, 0);
+    g_assert_false(aa_history_needs_confirmation(t.history, "patch_header.py"));
+    g_clear_error(&error);
+
+    g_assert_true(g_file_set_contents(file,
+        "# Auto-AI-PyPatch: commit-message: feat: add inspector\n"
+        "# Auto-AI-PyPatch: project: metroidvania\nprint('ok')\n", -1, NULL));
+    e = aa_executor_start_checked_with_pre_spawn(
+        watch, "patch_header.py", project, TRUE, header_record_attempt,
+        NULL, header_finished, &t, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(e);
+    g_main_loop_run(t.loop);
+    g_assert_true(t.finished);
+    g_assert_true(t.success);
+    g_assert_cmpuint(t.attempted, ==, 1);
+    g_assert_true(aa_history_needs_confirmation(t.history, "patch_header.py"));
+
+    g_main_loop_unref(t.loop);
+    aa_history_free(t.history);
+    aa_config_clear(&config);
+    g_autofree char *state = g_build_filename(root, "auto-ai-pypatch", "applied-history.ini", NULL);
+    g_autofree char *state_dir = g_path_get_dirname(state);
+    g_assert_cmpint(g_remove(file), ==, 0);
+    g_assert_cmpint(g_remove(state), ==, 0);
+    g_assert_cmpint(g_rmdir(state_dir), ==, 0);
+    g_assert_cmpint(g_rmdir(watch), ==, 0);
+    g_assert_cmpint(g_rmdir(project), ==, 0);
+    g_assert_cmpint(g_rmdir(root), ==, 0);
+}
+
 int main(int argc, char **argv) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/executor/python-success-failure-symlink", test_runner);
     g_test_add_func("/history/applied-separate-and-restart", test_applied_history);
     g_test_add_func("/executor/interrupt", test_cancel);
+    g_test_add_func("/executor/invalid-header-does-not-record-attempt", test_header_before_attempt);
     return g_test_run();
 }

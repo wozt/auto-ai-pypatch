@@ -95,14 +95,20 @@ guint aa_prompt_language_index(const char *code) {
 
 char *aa_prompt_generate(const AaConfig *c) {
     const PromptLanguage *lang = &languages[aa_prompt_language_index(c->language)];
-    g_autofree char *project = g_path_get_basename(c->project_dir && *c->project_dir ? c->project_dir : "project");
+    /* Never suggest a fake project identifier when no project is selected. */
+    if (!c->project_dir || !*c->project_dir)
+        return g_strdup("Sélectionne d'abord le dossier projet pour générer le prompt. / Select a project directory first.");
+    g_autofree char *project = g_path_get_basename(c->project_dir);
     g_autoptr(GError) error = NULL;
     g_autofree char *expected = aa_matcher_preview(c, &error);
     if (!expected) expected = g_strdup("<invalid regex>");
     return g_strdup_printf(
         "%s \"%s\".\n\n%s\n\n%s\n"
-        "# Auto-AI-PyPatch: commit-message: <feat: describe the changes>\n"
+        "# Auto-AI-PyPatch: commit-message: feat: implement requested changes\n"
         "# Auto-AI-PyPatch: project: %s\n\n"
+        "Copy these two lines verbatim to the opening Python comments; keep the exact project identifier "
+        "and replace only the commit-message description with a specific summary. "
+        "Do not add angle brackets, and never substitute the literal word 'project'.\n\n"
         "%s: `%s`\n%s: `%s`\n",
         lang->intro, project, lang->instructions, lang->metadata, project,
         lang->filename, expected, lang->additional,

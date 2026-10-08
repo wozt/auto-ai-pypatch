@@ -5,6 +5,9 @@ typedef struct AaExecutor AaExecutor;
 typedef void (*AaExecutorOutput)(const char *line, gboolean is_stderr, gpointer data);
 typedef void (*AaExecutorFinished)(gboolean success, int exit_code,
                                    const char *message, gpointer data);
+/* Persist attempt after immutable snapshot + metadata validation, before spawn.
+ * A FALSE result prevents Python from starting. */
+typedef gboolean (*AaExecutorPreSpawn)(gpointer data, GError **error);
 
 /* Non-blocking Python runner. Script runs with cwd=project_dir and stdin closed.
  * The chosen download is copied through O_NOFOLLOW into a private 0700 directory
@@ -28,6 +31,14 @@ gboolean aa_executor_remove_source(AaExecutor *executor, GError **error);
  * BEFORE launching Python. Existing start() remains compatible with non-Git tests. */
 AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basename,
                         const char *project_dir, gboolean git_enabled,
+                        AaExecutorOutput output, AaExecutorFinished finished,
+                        gpointer data, GError **error);
+/* Unlike start_checked(), this accepts a pre-spawn hook. It is never invoked
+ * for invalid patch metadata or a rejected download snapshot. */
+AaExecutor *aa_executor_start_checked_with_pre_spawn(
+                        const char *watch_dir, const char *basename,
+                        const char *project_dir, gboolean git_enabled,
+                        AaExecutorPreSpawn before_spawn,
                         AaExecutorOutput output, AaExecutorFinished finished,
                         gpointer data, GError **error);
 const char *aa_executor_commit_message(const AaExecutor *executor);

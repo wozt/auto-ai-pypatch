@@ -195,8 +195,10 @@ static gboolean copy_snapshot(AaExecutor *e, const char *watch_dir,
                                     contents->len, G_FILE_SET_CONTENTS_CONSISTENT, 0600, error);
 }
 
-AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basename,
+AaExecutor *aa_executor_start_checked_with_pre_spawn(
+                              const char *watch_dir, const char *basename,
                               const char *project_dir, gboolean git_enabled,
+                              AaExecutorPreSpawn before_spawn,
                               AaExecutorOutput output, AaExecutorFinished finished,
                               gpointer data, GError **error) {
     if (!project_dir || !g_file_test(project_dir, G_FILE_TEST_IS_DIR)) {
@@ -216,6 +218,14 @@ AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basenam
         e->commit_message = aa_patch_meta_read(e->stage_file, project_dir, error);
         if (!e->commit_message) { executor_free(e); return NULL; }
     }
+    /* The exact bytes that will run have now been snapshotted and validated. */
+    if (before_spawn && !before_spawn(data, error)) {
+        if (error && !*error)
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "Impossible d'enregistrer la tentative avant Python.");
+        executor_free(e);
+        return NULL;
+    }
     g_autoptr(GSubprocessLauncher) launcher = g_subprocess_launcher_new(
         G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
     g_subprocess_launcher_set_cwd(launcher, project_dir);
@@ -232,6 +242,14 @@ AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basenam
     schedule_read(&e->stderr_stream);
     g_subprocess_wait_async(e->process, NULL, wait_finished, e);
     return e;
+}
+
+AaExecutor *aa_executor_start_checked(const char *watch_dir, const char *basename,
+                              const char *project_dir, gboolean git_enabled,
+                              AaExecutorOutput output, AaExecutorFinished finished,
+                              gpointer data, GError **error) {
+    return aa_executor_start_checked_with_pre_spawn(watch_dir, basename, project_dir,
+                    git_enabled, NULL, output, finished, data, error);
 }
 
 AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,

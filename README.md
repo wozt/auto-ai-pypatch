@@ -152,3 +152,13 @@ meson test -C build --print-errorlogs
 ```
 
 Le test Git utilise un dépôt bare local temporaire ; il ne pousse **rien sur GitHub**.
+
+## Patch 005c — métadonnées et ordre de validation
+
+- Le prompt est régénéré en changeant le dossier projet, les filtres ou la numérotation.
+- Si aucun dossier projet n'est défini, aucun faux `project: project` n'est proposé.
+- Exemple de message de commit valide, sans chevrons ; le nom du projet est celui du dossier choisi.
+- En mode Git, l'en-tête est validé sur le snapshot privé **avant** l'enregistrement de la tentative.
+- L'enregistrement demeure **avant** le lancement Python : en cas d'échec/crash du script,
+  une nouvelle confirmation reste obligatoire. Une erreur d'en-tête n'inscrit plus de tentative.
+

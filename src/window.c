@@ -57,6 +57,7 @@ static void schedule_candidate_refresh(Ui *u);
 static void reset_preview_monitor(Ui *u);
 static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data);
 static void on_git_finished(gboolean success, const char *message, gpointer data);
+static void on_prompt(GtkButton *button, gpointer data);
 
 static GtkWidget *entry_row(GtkWidget *parent, const char *label, const char *value) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -313,6 +314,7 @@ static void on_field_changed(GtkEditable *editable, gpointer data) {
         aa_log_append(u->journal, "Filtres modifiés : surveillance arrêtée, relance-la.");
     }
     update_preview(u);
+    on_prompt(NULL, u); /* Includes folder selection and regex edits. */
 }
 
 static void on_age_changed(GtkSpinButton *spin, gpointer data) {
@@ -334,6 +336,7 @@ static void on_numbering_changed(GObject *switch_obj, GParamSpec *pspec, gpointe
         aa_log_append(u->journal, "Numérotation modifiée : surveillance arrêtée, relance-la.");
     }
     update_preview(u);
+    on_prompt(NULL, u);
 }
 
 static const char *const filename_examples[] = {
@@ -431,6 +434,12 @@ static void executor_output(const char *line, gboolean is_stderr, gpointer data)
     gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(u->log_view), &end, 0.0, FALSE, 0.0, 0.0);
 }
 
+static gboolean persist_attempt_before_python(gpointer data, GError **error) {
+    Ui *u = data;
+    /* Called after metadata validation, but BEFORE python3 is started. */
+    return aa_history_record_attempt(u->history, u->running_name, error);
+}
+
 static void execute_selected(Ui *u, const char *filename, guint64 number,
                              gboolean automatic, gboolean allow_expired) {
     if (!u->history || u->executor || u->git_job || u->closing || (automatic && !u->watcher)) return;
@@ -462,23 +471,19 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
         stop_watcher(u); /* No accidental auto-retries if Git worktree is dirty. */
         return;
     }
-    if (!aa_history_record_attempt(u->history, filename, &error)) {
-        g_autofree gchar *msg = g_strdup_printf("Impossible de sécuriser l'historique : %s", error->message);
-        log_problem(u, msg);
-        stop_watcher(u);
-        return;
-    }
+    /* History is saved by the executor callback after snapshot/header validation. */
     u->running_name = g_strdup(filename);
     u->running_number = number;
     u->running_automatic = automatic;
-    u->executor = aa_executor_start_checked(u->config.watch_dir, filename, u->config.project_dir,
-                                    u->config.git_enabled,
+    u->executor = aa_executor_start_checked_with_pre_spawn(
+                                    u->config.watch_dir, filename, u->config.project_dir,
+                                    u->config.git_enabled, persist_attempt_before_python,
                                     executor_output, on_executor_finished, u, &error);
     if (!u->executor) {
         g_autofree gchar *msg = g_strdup_printf("Démarrage Python refusé : %s", error->message);
         aa_log_append(u->journal, msg);
         g_clear_pointer(&u->running_name, g_free);
-        stop_watcher(u); /* The stored attempt requires manual reapproval. */
+        stop_watcher(u); /* Prevent repeated failures; invalid metadata left history untouched. */
         return;
     }
     g_autofree gchar *msg = g_strdup_printf("EXÉCUTION %s : %s (cwd=%s)",

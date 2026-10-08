@@ -69,6 +69,8 @@ static void invalid_regex(void) {
 static void languages(void) {
     AaConfig c;
     aa_config_init(&c);
+    g_free(c.project_dir);
+    c.project_dir = g_strdup("/tmp/test-project");
     g_assert_cmpuint(aa_prompt_language_count(), >=, 16);
     const char *codes[] = {"fr", "en", "de", "it", "es", "ja", "zh", "ko", "ru", "vi", "tl", "pt", "ar", "hi", "id", "tr", "nl", "pl", "uk", "th", "sv"};
     for (guint i = 0; i < G_N_ELEMENTS(codes); i++) {
@@ -82,6 +84,24 @@ static void languages(void) {
     aa_config_clear(&c);
 }
 
+static void project_metadata_prompt(void) {
+    AaConfig c;
+    aa_config_init(&c);
+    g_free(c.project_dir);
+    c.project_dir = g_strdup("/home/user/dev/metroidvania");
+    g_autofree char *prompt = aa_prompt_generate(&c);
+    g_assert_nonnull(g_strstr_len(prompt, -1,
+        "# Auto-AI-PyPatch: project: metroidvania\n"));
+    g_assert_nonnull(g_strstr_len(prompt, -1,
+        "# Auto-AI-PyPatch: commit-message: feat: implement requested changes\n"));
+    g_assert_null(g_strstr_len(prompt, -1, "commit-message: <"));
+    g_free(c.project_dir);
+    c.project_dir = g_strdup("");
+    g_autofree char *empty_prompt = aa_prompt_generate(&c);
+    g_assert_null(g_strstr_len(empty_prompt, -1, "# Auto-AI-PyPatch: project:"));
+    aa_config_clear(&c);
+}
+
 int main(int argc, char **argv) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/matcher/default", basic_preview);
@@ -89,5 +109,6 @@ int main(int argc, char **argv) {
     g_test_add_func("/matcher/and-literal", generic_regex_and_literal);
     g_test_add_func("/matcher/invalid", invalid_regex);
     g_test_add_func("/prompt/languages", languages);
+    g_test_add_func("/prompt/real-project-metadata", project_metadata_prompt);
     return g_test_run();
 }
