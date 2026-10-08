@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "candidate.h"
 #include "matcher.h"
 #include <errno.h>
