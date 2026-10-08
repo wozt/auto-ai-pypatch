@@ -12,3 +12,10 @@ candidate_test = executable('candidate_test',
   dependencies: [dependency('glib-2.0'), gio],
 )
 test('candidate-selection-and-history', candidate_test)
+
+executor_test = executable('executor_test',
+  files('executor_test.c', '../src/executor.c', '../src/history.c', '../src/config.c'),
+  include_directories: include_directories('../src'),
+  dependencies: [dependency('glib-2.0'), gio],
+)
+test('executor-and-applied-history', executor_test, timeout: 30)

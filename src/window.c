@@ -5,6 +5,7 @@
 #include "matcher.h"
 #include "candidate.h"
 #include "history.h"
+#include "executor.h"
 #include "log.h"
 #include <gio/gio.h>
 
@@ -12,12 +13,24 @@ typedef struct {
     AaConfig config;
     AaWatcher *watcher;
     AaHistory *history;
+    AaExecutor *executor;
+    GtkWidget *cancel_button;
+    GtkWidget *settings_box;
+    GCancellable *decision_cancel;
+    gchar *pending_name;
+    guint64 pending_number;
+    gchar *running_name;
+    guint64 running_number;
+    guint auto_success_count;
+    gboolean running_automatic;
+    gboolean closing;
     guint scan_source;
     char *last_problem;
     GtkWidget *window;
     GtkWidget *start_button;
     GtkWidget *status;
     GtkTextBuffer *journal;
+    GtkWidget *log_view;
     GtkTextBuffer *prompt;
     GtkWidget *watch_entry, *project_entry, *regex_entry, *prefix_entry;
     GtkWidget *suffix_entry, *extension_entry, *number_regex_entry;
@@ -28,6 +41,7 @@ typedef struct {
 
 static void stop_watcher(Ui *u);
 static void schedule_scan(Ui *u);
+static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data);
 
 static GtkWidget *entry_row(GtkWidget *parent, const char *label, const char *value) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -279,37 +293,161 @@ static void log_problem(Ui *u, const char *detail) {
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance : intervention nécessaire");
 }
 
+static void executor_output(const char *line, gboolean is_stderr, gpointer data) {
+    Ui *u = data;
+    g_autofree gchar *message = g_strdup_printf("%s | %s", is_stderr ? "stderr" : "stdout", line);
+    aa_log_append(u->journal, message);
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(u->journal, &end);
+    gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(u->log_view), &end, 0.0, FALSE, 0.0, 0.0);
+}
+
+static void execute_selected(Ui *u, const char *filename, guint64 number,
+                             gboolean automatic) {
+    if (!u->watcher || !u->history || u->executor || u->closing) return;
+    /* Rescan at approval time: a second file may have arrived while the dialog was open. */
+    AaCandidateResult check = {0};
+    g_autoptr(GError) error = NULL;
+    if (!aa_candidate_scan(&u->config, u->history, &check, &error) ||
+        check.status != AA_CANDIDATE_READY || g_strcmp0(check.filename, filename) != 0 ||
+        (u->config.numbering && check.number != number)) {
+        aa_log_append(u->journal, "Sélection modifiée ou ambiguë avant exécution : action annulée.");
+        aa_candidate_result_clear(&check);
+        schedule_scan(u);
+        return;
+    }
+    aa_candidate_result_clear(&check);
+    if (!aa_history_record_attempt(u->history, filename, &error)) {
+        g_autofree gchar *msg = g_strdup_printf("Impossible de sécuriser l'historique : %s", error->message);
+        log_problem(u, msg);
+        stop_watcher(u);
+        return;
+    }
+    u->running_name = g_strdup(filename);
+    u->running_number = number;
+    u->running_automatic = automatic;
+    u->executor = aa_executor_start(u->config.watch_dir, filename, u->config.project_dir,
+                                    executor_output, on_executor_finished, u, &error);
+    if (!u->executor) {
+        g_autofree gchar *msg = g_strdup_printf("Démarrage Python refusé : %s", error->message);
+        aa_log_append(u->journal, msg);
+        g_clear_pointer(&u->running_name, g_free);
+        stop_watcher(u); /* The stored attempt requires manual reapproval. */
+        return;
+    }
+    g_autofree gchar *msg = g_strdup_printf("EXÉCUTION %s : %s (cwd=%s)",
+        automatic ? "AUTO" : "CONFIRMÉE", filename, u->config.project_dir);
+    aa_log_append(u->journal, msg);
+    gtk_label_set_text(GTK_LABEL(u->status), "Exécution Python en cours…");
+    gtk_widget_set_sensitive(u->cancel_button, TRUE);
+    gtk_widget_set_sensitive(u->settings_box, FALSE);
+    gtk_widget_set_sensitive(u->start_button, TRUE); /* Stop only stops file detection. */
+}
+
+static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data) {
+    Ui *u = data;
+    u->executor = NULL; /* executor destroys itself after this callback returns. */
+    gtk_widget_set_sensitive(u->cancel_button, FALSE);
+    gtk_widget_set_sensitive(u->settings_box, !u->watcher);
+    g_autofree gchar *msg = g_strdup_printf("%s : %s", success ? "SUCCÈS" : "ÉCHEC", message);
+    aa_log_append(u->journal, msg);
+    if (success && u->history) {
+        g_autoptr(GError) error = NULL;
+        if (!aa_history_record_applied(u->history, u->running_name,
+                                       u->config.numbering, u->running_number, &error)) {
+            g_autofree gchar *failure = g_strdup_printf("Historique d'application NON enregistré : %s", error->message);
+            aa_log_append(u->journal, failure);
+            success = FALSE;
+        } else if (u->running_automatic && u->auto_success_count < G_MAXUINT) {
+            u->auto_success_count++;
+        }
+    }
+    g_clear_pointer(&u->running_name, g_free);
+    if (!success || u->closing) {
+        stop_watcher(u); /* Never retry a failed/unknown patch automatically. */
+        if (!u->closing) aa_log_append(u->journal, "Surveillance arrêtée après échec ; nouvel essai = confirmation obligatoire.");
+    } else if (u->watcher) {
+        gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (exécution disponible)");
+        schedule_scan(u);
+    }
+    if (!u->watcher && u->history) {
+        aa_history_free(u->history);
+        u->history = NULL;
+    }
+    if (!u->closing && !u->watcher) gtk_widget_set_sensitive(u->settings_box, TRUE);
+    if (u->closing) gtk_window_destroy(GTK_WINDOW(u->window));
+    (void)exit_code;
+}
+
+static void on_decision(GObject *source, GAsyncResult *result, gpointer data) {
+    Ui *u = data;
+    g_autoptr(GError) error = NULL;
+    int answer = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source), result, &error);
+    gchar *filename = g_steal_pointer(&u->pending_name);
+    guint64 number = u->pending_number;
+    g_clear_object(&u->decision_cancel);
+    if (u->closing) {
+        g_free(filename);
+        gtk_window_destroy(GTK_WINDOW(u->window));
+        return;
+    }
+    if (answer == 1 && filename && !u->watcher) {
+        aa_log_append(u->journal, "Confirmation ignorée : surveillance arrêtée.");
+    } else if (answer == 1 && filename) {
+        u->auto_success_count = 0; /* Explicit approval resets the automatic quota. */
+        execute_selected(u, filename, number, FALSE);
+    } else {
+        aa_log_append(u->journal, "Patch ignoré : validation manuelle annulée.");
+    }
+    g_free(filename);
+}
+
+static void request_approval(Ui *u, const char *filename, guint64 number,
+                             gboolean quota_reached, gboolean previous_attempt) {
+    if (u->pending_name || u->executor) return;
+    u->pending_name = g_strdup(filename);
+    u->pending_number = number;
+    g_autofree gchar *message = g_strdup_printf(
+        "Fichier : %s\nProjet : %s\n%s%s\n"
+        "Un script Python téléchargé peut modifier ou supprimer tous les fichiers accessibles à ton compte.",
+        filename, u->config.project_dir,
+        quota_reached ? "Quota d'exécutions automatiques atteint.\n" : "",
+        previous_attempt ? "Déjà tenté : nouvelle confirmation impérative.\n" : "");
+    GtkAlertDialog *dialog = gtk_alert_dialog_new("Exécuter ce patch Python ?");
+    gtk_alert_dialog_set_detail(dialog, message);
+    const char *buttons[] = {"Annuler", "Exécuter", NULL};
+    gtk_alert_dialog_set_buttons(dialog, buttons);
+    gtk_alert_dialog_set_cancel_button(dialog, 0);
+    gtk_alert_dialog_set_default_button(dialog, 0);
+    u->decision_cancel = g_cancellable_new();
+    gtk_alert_dialog_choose(dialog, GTK_WINDOW(u->window), u->decision_cancel, on_decision, u);
+    g_object_unref(dialog);
+    gtk_label_set_text(GTK_LABEL(u->status), "Confirmation nécessaire");
+}
+
 static gboolean scan_candidates(gpointer data) {
     Ui *u = data;
     u->scan_source = 0;
-    if (!u->watcher || !u->history) return G_SOURCE_REMOVE;
+    if (!u->watcher || !u->history || u->executor || u->pending_name || u->closing) return G_SOURCE_REMOVE;
     AaCandidateResult result = {0};
     g_autoptr(GError) error = NULL;
     if (!aa_candidate_scan(&u->config, u->history, &result, &error)) {
-        g_autofree char *msg = g_strdup_printf("Erreur de lecture du dossier : %s", error->message);
+        g_autofree gchar *msg = g_strdup_printf("Erreur de lecture du dossier : %s", error->message);
         log_problem(u, msg);
-        aa_candidate_result_clear(&result);
-        return G_SOURCE_REMOVE;
-    }
-    if (result.status == AA_CANDIDATE_NONE) {
+    } else if (result.status == AA_CANDIDATE_NONE) {
         g_clear_pointer(&u->last_problem, g_free);
-        gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
+        gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (exécution disponible)");
     } else if (result.status != AA_CANDIDATE_READY) {
         log_problem(u, result.detail ? result.detail : "Fichier non conforme.");
     } else {
-        if (!aa_history_record_preview(u->history, result.filename,
-                                       u->config.numbering, result.number, &error)) {
-            g_autofree char *msg = g_strdup_printf("Historique non enregistré : %s", error->message);
-            log_problem(u, msg);
-        } else {
-            g_clear_pointer(&u->last_problem, g_free);
-            g_autofree char *msg = u->config.numbering
-                ? g_strdup_printf("VALIDÉ EN SIMULATION : %s (numéro %" G_GUINT64_FORMAT
-                                  "). Aucun script exécuté.", result.filename, result.number)
-                : g_strdup_printf("VALIDÉ EN SIMULATION : %s. Aucun script exécuté.", result.filename);
-            aa_log_append(u->journal, msg);
-            gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
-        }
+        g_clear_pointer(&u->last_problem, g_free);
+        gboolean previous = aa_history_needs_confirmation(u->history, result.filename);
+        gboolean quota = u->config.automatic && u->config.auto_limit > 0 &&
+                         u->auto_success_count >= u->config.auto_limit;
+        if (u->config.automatic && !quota && !previous)
+            execute_selected(u, result.filename, result.number, TRUE);
+        else
+            request_approval(u, result.filename, result.number, quota, previous);
     }
     aa_candidate_result_clear(&result);
     return G_SOURCE_REMOVE;
@@ -336,9 +474,12 @@ static void stop_watcher(Ui *u) {
         aa_watcher_stop(u->watcher);
         u->watcher = NULL;
     }
-    aa_history_free(u->history);
-    u->history = NULL;
+    if (!u->executor) {
+        aa_history_free(u->history);
+        u->history = NULL;
+    }
     g_clear_pointer(&u->last_problem, g_free);
+    if (!u->executor) gtk_widget_set_sensitive(u->settings_box, TRUE);
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Démarrer");
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance arrêtée");
 }
@@ -348,9 +489,10 @@ static void on_start(GtkButton *button, gpointer data) {
     Ui *u = data;
     if (u->watcher) {
         stop_watcher(u);
-        aa_log_append(u->journal, "Surveillance arrêtée.");
+        aa_log_append(u->journal, "Surveillance arrêtée. Le script en cours continue : utilise Interrompre si nécessaire.");
         return;
     }
+    if (u->executor || u->pending_name) return;
     collect(u);
     g_autoptr(GError) error = NULL;
     if (!aa_matcher_validate(&u->config, &error)) {
@@ -363,7 +505,7 @@ static void on_start(GtkButton *button, gpointer data) {
         aa_log_append(u->journal, "Erreur : sélectionne deux dossiers existants (surveillance et projet).");
         return;
     }
-    u->history = aa_history_open(&u->config, &error);
+    u->history = aa_history_open_applied(&u->config, &error);
     if (!u->history) {
         g_autofree char *msg = g_strdup_printf("Historique inaccessible : %s", error->message);
         aa_log_append(u->journal, msg);
@@ -378,15 +520,34 @@ static void on_start(GtkButton *button, gpointer data) {
         return;
     }
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Arrêter");
-    gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
+    gtk_widget_set_sensitive(u->settings_box, FALSE);
+    gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (exécution disponible)");
+    u->auto_success_count = 0;
     aa_log_append(u->journal,
-        "Simulation : sélection unique, âge maximal, séquence et anti-doublon actifs. Python/Git désactivés.");
+        u->config.automatic ? "Mode AUTOMATIQUE activé : Python peut modifier ton projet sans validation, Git inactif."
+                            : "Mode MANUEL : confirmation avant chaque exécution Python, Git inactif.");
     schedule_scan(u); /* Also inspect files that arrived just before Start. */
+}
+
+static void on_cancel_running(GtkButton *button, gpointer data) {
+    (void)button;
+    Ui *u = data;
+    if (u->executor) {
+        aa_log_append(u->journal, "Interruption demandée : processus Python arrêté.");
+        aa_executor_cancel(u->executor);
+    }
 }
 
 static gboolean on_close(GtkWindow *window, gpointer data) {
     (void)window;
     Ui *u = data;
+    if (u->executor || u->pending_name) {
+        u->closing = TRUE;
+        stop_watcher(u);
+        if (u->decision_cancel) g_cancellable_cancel(u->decision_cancel);
+        if (u->executor) aa_executor_cancel(u->executor);
+        return TRUE; /* Keep the UI alive until async callbacks have completed. */
+    }
     stop_watcher(u);
     collect(u);
     GtkWidget *entries[] = {u->watch_entry, u->project_entry, u->regex_entry,
@@ -439,6 +600,10 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     u->start_button = gtk_button_new_with_label("Démarrer");
     gtk_box_append(GTK_BOX(toolbar), u->start_button);
     g_signal_connect(u->start_button, "clicked", G_CALLBACK(on_start), u);
+    u->cancel_button = gtk_button_new_with_label("Interrompre Python");
+    gtk_widget_set_sensitive(u->cancel_button, FALSE);
+    gtk_box_append(GTK_BOX(toolbar), u->cancel_button);
+    g_signal_connect(u->cancel_button, "clicked", G_CALLBACK(on_cancel_running), u);
     GtkWidget *save = gtk_button_new_with_label("Enregistrer");
     gtk_box_append(GTK_BOX(toolbar), save);
     g_signal_connect(save, "clicked", G_CALLBACK(on_save), u);
@@ -484,6 +649,7 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     gtk_paned_set_start_child(GTK_PANED(paned), left_scroll);
     gtk_paned_set_resize_start_child(GTK_PANED(paned), FALSE);
     GtkWidget *settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    u->settings_box = settings;
     gtk_widget_set_margin_end(settings, 14);
     gtk_widget_set_margin_top(settings, 4);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(left_scroll), settings);
@@ -506,12 +672,16 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     gtk_widget_set_sensitive(u->number_examples, u->config.numbering);
     u->age_spin = spin_row(settings, "Âge maximal (secondes)", u->config.max_age);
     u->limit_spin = spin_row(settings, "Limite automatique (0 = infini)", u->config.auto_limit);
-    u->auto_switch = switch_row(settings, "Exécution automatique (future)", u->config.automatic);
-    u->git_switch = switch_row(settings, "Git add/commit/push (futur)", u->config.git_enabled);
+    u->auto_switch = switch_row(settings, "Exécution automatique (code non isolé)", u->config.automatic);
+    gtk_widget_set_tooltip_text(u->auto_switch,
+        "ATTENTION : ces scripts Python disposent de tous les droits de ton compte utilisateur.");
+    u->git_switch = switch_row(settings, "Git add/commit/push (patch 005)", u->config.git_enabled);
+    gtk_widget_set_sensitive(u->git_switch, FALSE);
 
     GtkWidget *right_scroll = gtk_scrolled_window_new();
     gtk_paned_set_end_child(GTK_PANED(paned), right_scroll);
     GtkWidget *log_view = gtk_text_view_new();
+    u->log_view = log_view;
     gtk_text_view_set_editable(GTK_TEXT_VIEW(log_view), FALSE);
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(log_view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(log_view), TRUE);
@@ -541,6 +711,6 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     g_signal_connect(u->age_spin, "value-changed", G_CALLBACK(on_age_changed), u);
     update_preview(u);
     on_prompt(NULL, u);
-    aa_log_append(u->journal, "Phase 3 : sélection et historique de simulation actifs. Python/Git désactivés.");
+    aa_log_append(u->journal, "Phase 4 : exécution Python avec confirmation/quota et historique appliqué. Git désactivé.");
     return u->window;
 }

@@ -52,3 +52,23 @@ L'aperçu affichera : `^patch_(?:[0-9]{4})_fix\.py$` (avec un seul antislash dan
 - Historique de **simulation**, par projet et par filtres : `~/.local/state/auto-ai-pypatch/preview-history.ini`. Pour réinitialiser les essais, arrêter l'app puis déplacer ce fichier.
 
 **Aucun patch Python n'est exécuté et aucun Git automatique n'est lancé** dans cette phase. Le moteur réel devra utiliser un historique d'exécution séparé et revérifier les fichiers juste avant leur exécution.
+
+
+## Phase 4 — Python runner (no automatic Git yet)
+
+- Select a **dedicated, disposable watch directory** and a **test project** initially.
+  Press Start only after checking the active filename filters.
+- Manual mode shows an explicit **Exécuter** confirmation for each new script.
+  Automatic mode runs without prompting until `auto_limit` successful automatic
+  scripts (0 means unlimited); the next candidate needs confirmation.
+- Execution is asynchronous (`GSubprocess`) with live stdout/stderr and exit status,
+  working directory set to the project root. Stdin is closed; interactive scripts
+  cannot request terminal input. Press **Interrompre Python** to kill the child.
+- Only exit code 0 is recorded as applied. A crash, kill or failure leaves a
+  persistent *attempt* marker so that retrying the same filename requires manual
+  confirmation. Applied history is separate from the phase-3 simulation history.
+- A private snapshot of the downloaded file is taken using `O_NOFOLLOW` and a
+  regular-file check (4 MiB maximum); the snapshot is deleted afterwards.
+- **IMPORTANT:** Scripts execute with the full privileges of your user account,
+  **without any sandbox**. Never auto-run downloaded code from untrusted sources.
+  `Git add/commit/push` remains disabled until a later phase.
