@@ -46,8 +46,9 @@ void aa_candidate_result_clear(AaCandidateResult *r) {
     *r = (AaCandidateResult){0};
 }
 
-gboolean aa_candidate_scan(const AaConfig *c, const AaHistory *history,
-                           AaCandidateResult *result, GError **error) {
+static gboolean scan_impl(const AaConfig *c, const AaHistory *history,
+                          AaCandidateResult *result, gboolean include_expired,
+                          GError **error) {
     *result = (AaCandidateResult){0};
     g_autoptr(GDir) directory = g_dir_open(c->watch_dir, 0, error);
     if (!directory) return FALSE;
@@ -61,7 +62,7 @@ gboolean aa_candidate_scan(const AaConfig *c, const AaHistory *history,
         if (g_lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
         /* 0 disables age checking. Ignore grossly future-dated files. */
         gint64 age = now - (gint64)st.st_mtime;
-        if (age < -300 || (c->max_age && age > (gint64)c->max_age)) continue;
+        if (age < -300 || (!include_expired && c->max_age && age > (gint64)c->max_age)) continue;
         g_ptr_array_add(choices, g_strdup(name));
     }
     result->eligible_count = choices->len;
@@ -80,6 +81,17 @@ gboolean aa_candidate_scan(const AaConfig *c, const AaHistory *history,
         return TRUE;
     }
     result->filename = g_strdup(g_ptr_array_index(choices, 0));
+    /* Re-stat to annotate the candidate's current age. The executor will
+       pin a no-follow snapshot before running; this is presentation metadata. */
+    g_autofree char *selected_path = g_build_filename(c->watch_dir, result->filename, NULL);
+    GStatBuf selected_st;
+    if (g_lstat(selected_path, &selected_st) != 0 || !S_ISREG(selected_st.st_mode)) {
+        g_free(result->filename);
+        result->filename = NULL;
+        result->eligible_count = 0;
+        return TRUE;
+    }
+    result->age_seconds = MAX((gint64)0, now - (gint64)selected_st.st_mtime);
     if (c->numbering) {
         if (!numeric_segment(c, result->filename, &result->number)) {
             result->status = AA_CANDIDATE_INVALID_NUMBER;
@@ -96,6 +108,20 @@ gboolean aa_candidate_scan(const AaConfig *c, const AaHistory *history,
             return TRUE;
         }
     }
-    result->status = AA_CANDIDATE_READY;
+    result->status = (c->max_age && result->age_seconds > (gint64)c->max_age)
+        ? AA_CANDIDATE_TOO_OLD : AA_CANDIDATE_READY;
     return TRUE;
+}
+
+gboolean aa_candidate_scan(const AaConfig *c, const AaHistory *history,
+                           AaCandidateResult *result, GError **error) {
+    return scan_impl(c, history, result, FALSE, error);
+}
+
+gboolean aa_candidate_scan_preview(const AaConfig *c, const AaHistory *history,
+                                   AaCandidateResult *result, GError **error) {
+    if (!scan_impl(c, history, result, FALSE, error)) return FALSE;
+    if (result->status != AA_CANDIDATE_NONE) return TRUE;
+    aa_candidate_result_clear(result);
+    return scan_impl(c, history, result, TRUE, error);
 }

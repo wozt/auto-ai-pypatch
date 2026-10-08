@@ -15,10 +15,18 @@ typedef struct {
     AaHistory *history;
     AaExecutor *executor;
     GtkWidget *cancel_button;
+    GtkWidget *apply_button;
+    GtkWidget *candidate_label;
     GtkWidget *settings_box;
     GCancellable *decision_cancel;
     gchar *pending_name;
     guint64 pending_number;
+    gboolean pending_from_button;
+    gboolean pending_allow_expired;
+    GFileMonitor *preview_monitor;
+    gchar *preview_watch_dir;
+    guint preview_source;
+    guint expiry_source;
     gchar *running_name;
     guint64 running_number;
     guint auto_success_count;
@@ -41,6 +49,9 @@ typedef struct {
 
 static void stop_watcher(Ui *u);
 static void schedule_scan(Ui *u);
+static void refresh_candidate(Ui *u);
+static void schedule_candidate_refresh(Ui *u);
+static void reset_preview_monitor(Ui *u);
 static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data);
 
 static GtkWidget *entry_row(GtkWidget *parent, const char *label, const char *value) {
@@ -177,6 +188,117 @@ static void update_preview(Ui *u) {
         gtk_label_set_markup(GTK_LABEL(u->preview), markup);
         gtk_label_set_text(GTK_LABEL(u->preview_extra), "Corrige la regex avant de démarrer la surveillance.");
     }
+    reset_preview_monitor(u);
+    refresh_candidate(u);
+}
+
+/* This is a display-only monitor, independent of Start/Stop (which controls
+ * automatic execution). GFileMonitor is event-driven; no periodic directory ls.
+ */
+static gboolean on_preview_refresh(gpointer data) {
+    Ui *u = data;
+    u->preview_source = 0;
+    refresh_candidate(u);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_candidate_refresh(Ui *u) {
+    if (!u->closing && !u->preview_source)
+        u->preview_source = g_timeout_add(200, on_preview_refresh, u);
+}
+
+static void on_preview_monitor_changed(GFileMonitor *monitor, GFile *file,
+                                        GFile *other_file, GFileMonitorEvent event,
+                                        gpointer data) {
+    (void)monitor; (void)file; (void)other_file; (void)event;
+    schedule_candidate_refresh(data);
+}
+
+static void reset_preview_monitor(Ui *u) {
+    const char *path = u->config.watch_dir;
+    if (g_strcmp0(path, u->preview_watch_dir) == 0) return;
+    if (u->preview_monitor) {
+        g_signal_handlers_disconnect_by_data(u->preview_monitor, u);
+        g_file_monitor_cancel(u->preview_monitor);
+        g_clear_object(&u->preview_monitor);
+    }
+    g_free(u->preview_watch_dir);
+    u->preview_watch_dir = g_strdup(path);
+    if (!path || !g_file_test(path, G_FILE_TEST_IS_DIR)) return;
+    g_autoptr(GFile) folder = g_file_new_for_path(path);
+    u->preview_monitor = g_file_monitor_directory(folder, G_FILE_MONITOR_WATCH_MOVES,
+                                                   NULL, NULL);
+    if (u->preview_monitor)
+        g_signal_connect(u->preview_monitor, "changed",
+                         G_CALLBACK(on_preview_monitor_changed), u);
+}
+
+static gboolean on_candidate_expiry(gpointer data) {
+    Ui *u = data;
+    u->expiry_source = 0;
+    refresh_candidate(u);
+    return G_SOURCE_REMOVE;
+}
+
+static void candidate_markup(Ui *u, const char *color, const char *message,
+                             gboolean can_apply) {
+    g_autofree gchar *safe = g_markup_escape_text(message, -1);
+    g_autofree gchar *markup = g_strdup_printf(
+        "<span foreground='%s' weight='bold' font_family='monospace'>DETECTED FILENAME: %s</span>",
+        color, safe);
+    gtk_label_set_markup(GTK_LABEL(u->candidate_label), markup);
+    gtk_widget_set_sensitive(u->apply_button,
+        can_apply && g_file_test(u->config.project_dir, G_FILE_TEST_IS_DIR) &&
+        !u->executor && !u->pending_name && !u->closing);
+}
+
+static void refresh_candidate(Ui *u) {
+    if (!u->candidate_label || !u->apply_button || u->closing) return;
+    if (u->expiry_source) {
+        g_source_remove(u->expiry_source);
+        u->expiry_source = 0;
+    }
+    if (u->executor || u->pending_name) {
+        candidate_markup(u, "#729fcf", u->running_name ? u->running_name : "confirmation en attente", FALSE);
+        return;
+    }
+    g_autoptr(GError) error = NULL;
+    if (!aa_matcher_validate(&u->config, &error)) {
+        candidate_markup(u, "#e04b4b", "regex invalide", FALSE);
+        return;
+    }
+    if (!g_file_test(u->config.watch_dir, G_FILE_TEST_IS_DIR)) {
+        candidate_markup(u, "#999999", "dossier surveillé indisponible", FALSE);
+        return;
+    }
+    AaHistory *history = u->history;
+    gboolean own_history = FALSE;
+    if (!history) {
+        history = aa_history_open_applied(&u->config, &error);
+        own_history = TRUE;
+    }
+    AaCandidateResult result = {0};
+    gboolean ok = history && aa_candidate_scan_preview(&u->config, history, &result, &error);
+    if (!ok) {
+        candidate_markup(u, "#e04b4b", error ? error->message : "historique inaccessible", FALSE);
+    } else if (result.status == AA_CANDIDATE_READY) {
+        candidate_markup(u, "#5d9cec", result.filename, TRUE);
+        /* One-shot expiration notification; this does not poll the filesystem. */
+        if (u->config.max_age && result.age_seconds <= u->config.max_age) {
+            guint seconds = (guint)(u->config.max_age - result.age_seconds + 1);
+            u->expiry_source = g_timeout_add_seconds(MAX(1u, seconds), on_candidate_expiry, u);
+        }
+    } else if (result.status == AA_CANDIDATE_TOO_OLD) {
+        g_autofree gchar *name = g_strdup_printf("%s (trop ancien : %" G_GINT64_FORMAT " s)",
+                                                  result.filename, result.age_seconds);
+        candidate_markup(u, "#e6a23c", name, TRUE);
+    } else if (result.status == AA_CANDIDATE_NONE) {
+        candidate_markup(u, "#999999", "aucun nouveau fichier correspondant", FALSE);
+    } else {
+        candidate_markup(u, "#e04b4b", result.detail ? result.detail : "candidat non valide", FALSE);
+    }
+    aa_candidate_result_clear(&result);
+    if (own_history) aa_history_free(history);
 }
 
 static void on_field_changed(GtkEditable *editable, gpointer data) {
@@ -196,6 +318,8 @@ static void on_age_changed(GtkSpinButton *spin, gpointer data) {
         stop_watcher(u);
         aa_log_append(u->journal, "Âge maximal modifié : surveillance arrêtée, relance-la.");
     }
+    collect(u);
+    refresh_candidate(u);
 }
 
 static void on_numbering_changed(GObject *switch_obj, GParamSpec *pspec, gpointer data) {
@@ -304,17 +428,26 @@ static void executor_output(const char *line, gboolean is_stderr, gpointer data)
 }
 
 static void execute_selected(Ui *u, const char *filename, guint64 number,
-                             gboolean automatic) {
-    if (!u->watcher || !u->history || u->executor || u->closing) return;
+                             gboolean automatic, gboolean allow_expired) {
+    if (!u->history || u->executor || u->closing || (automatic && !u->watcher)) return;
     /* Rescan at approval time: a second file may have arrived while the dialog was open. */
     AaCandidateResult check = {0};
     g_autoptr(GError) error = NULL;
-    if (!aa_candidate_scan(&u->config, u->history, &check, &error) ||
-        check.status != AA_CANDIDATE_READY || g_strcmp0(check.filename, filename) != 0 ||
+    gboolean scanned = allow_expired
+        ? aa_candidate_scan_preview(&u->config, u->history, &check, &error)
+        : aa_candidate_scan(&u->config, u->history, &check, &error);
+    if (!scanned || (check.status != AA_CANDIDATE_READY &&
+                     !(allow_expired && check.status == AA_CANDIDATE_TOO_OLD)) ||
+        g_strcmp0(check.filename, filename) != 0 ||
         (u->config.numbering && check.number != number)) {
         aa_log_append(u->journal, "Sélection modifiée ou ambiguë avant exécution : action annulée.");
         aa_candidate_result_clear(&check);
+        if (!u->watcher && u->history) {
+            aa_history_free(u->history);
+            u->history = NULL;
+        }
         schedule_scan(u);
+        schedule_candidate_refresh(u);
         return;
     }
     aa_candidate_result_clear(&check);
@@ -341,6 +474,7 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
     aa_log_append(u->journal, msg);
     gtk_label_set_text(GTK_LABEL(u->status), "Exécution Python en cours…");
     gtk_widget_set_sensitive(u->cancel_button, TRUE);
+    gtk_widget_set_sensitive(u->apply_button, FALSE);
     gtk_widget_set_sensitive(u->settings_box, FALSE);
     gtk_widget_set_sensitive(u->start_button, TRUE); /* Stop only stops file detection. */
 }
@@ -394,6 +528,7 @@ static void on_executor_finished(gboolean success, int exit_code, const char *me
     }
     if (!u->closing && !u->watcher) gtk_widget_set_sensitive(u->settings_box, TRUE);
     if (u->closing) gtk_window_destroy(GTK_WINDOW(u->window));
+    else schedule_candidate_refresh(u);
     (void)exit_code;
 }
 
@@ -403,37 +538,54 @@ static void on_decision(GObject *source, GAsyncResult *result, gpointer data) {
     int answer = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(source), result, &error);
     gchar *filename = g_steal_pointer(&u->pending_name);
     guint64 number = u->pending_number;
+    gboolean from_button = u->pending_from_button;
+    gboolean allow_expired = u->pending_allow_expired;
+    u->pending_from_button = FALSE;
+    u->pending_allow_expired = FALSE;
     g_clear_object(&u->decision_cancel);
     if (u->closing) {
         g_free(filename);
         gtk_window_destroy(GTK_WINDOW(u->window));
         return;
     }
-    if (answer == 1 && filename && !u->watcher) {
+    if (answer == 1 && filename && !u->watcher && !from_button) {
         aa_log_append(u->journal, "Confirmation ignorée : surveillance arrêtée.");
     } else if (answer == 1 && filename) {
         u->auto_success_count = 0; /* Explicit approval resets the automatic quota. */
-        execute_selected(u, filename, number, FALSE);
+        execute_selected(u, filename, number, FALSE, allow_expired);
     } else {
         aa_log_append(u->journal, "Patch ignoré : validation manuelle annulée.");
     }
     g_free(filename);
+    if (!u->watcher && !u->executor) {
+        aa_history_free(u->history);
+        u->history = NULL;
+        gtk_widget_set_sensitive(u->settings_box, TRUE);
+    }
+    schedule_candidate_refresh(u);
 }
 
 static void request_approval(Ui *u, const char *filename, guint64 number,
-                             gboolean quota_reached, gboolean previous_attempt) {
+                             gboolean quota_reached, gboolean previous_attempt,
+                             gboolean from_button, gboolean allow_expired) {
     if (u->pending_name || u->executor) return;
     u->pending_name = g_strdup(filename);
     u->pending_number = number;
+    u->pending_from_button = from_button;
+    u->pending_allow_expired = allow_expired;
+    gtk_widget_set_sensitive(u->apply_button, FALSE);
+    gtk_widget_set_sensitive(u->settings_box, FALSE);
     g_autofree gchar *message = g_strdup_printf(
-        "Fichier : %s\nProjet : %s\n%s%s\n"
+        "Fichier : %s\nProjet : %s\n%s%s%s\n"
         "Un script Python téléchargé peut modifier ou supprimer tous les fichiers accessibles à ton compte.",
         filename, u->config.project_dir,
         quota_reached ? "Quota d'exécutions automatiques atteint.\n" : "",
-        previous_attempt ? "Déjà tenté : nouvelle confirmation impérative.\n" : "");
+        previous_attempt ? "Déjà tenté : nouvelle confirmation impérative.\n" : "",
+        allow_expired ? "ATTENTION : fichier trop ancien ; veux-tu contourner UNIQUEMENT la limite d'âge ?\n" : "");
     GtkAlertDialog *dialog = gtk_alert_dialog_new("Exécuter ce patch Python ?");
     gtk_alert_dialog_set_detail(dialog, message);
-    const char *buttons[] = {"Annuler", "Exécuter", NULL};
+    const char *buttons[] = {allow_expired ? "No" : "Annuler",
+                              allow_expired ? "Yes" : "Exécuter", NULL};
     gtk_alert_dialog_set_buttons(dialog, buttons);
     gtk_alert_dialog_set_cancel_button(dialog, 0);
     gtk_alert_dialog_set_default_button(dialog, 0);
@@ -441,6 +593,50 @@ static void request_approval(Ui *u, const char *filename, guint64 number,
     gtk_alert_dialog_choose(dialog, GTK_WINDOW(u->window), u->decision_cancel, on_decision, u);
     g_object_unref(dialog);
     gtk_label_set_text(GTK_LABEL(u->status), "Confirmation nécessaire");
+}
+
+static void on_apply_patch(GtkButton *button, gpointer data) {
+    (void)button;
+    Ui *u = data;
+    if (u->closing || u->executor || u->pending_name) return;
+    collect(u);
+    g_autoptr(GError) error = NULL;
+    if (!aa_matcher_validate(&u->config, &error) ||
+        !g_file_test(u->config.watch_dir, G_FILE_TEST_IS_DIR) ||
+        !g_file_test(u->config.project_dir, G_FILE_TEST_IS_DIR)) {
+        aa_log_append(u->journal, error ? error->message : "Sélectionne deux dossiers valides.");
+        refresh_candidate(u);
+        return;
+    }
+    if (!u->history) u->history = aa_history_open_applied(&u->config, &error);
+    if (!u->history) {
+        aa_log_append(u->journal, error ? error->message : "Impossible de lire l'historique.");
+        refresh_candidate(u);
+        return;
+    }
+    AaCandidateResult result = {0};
+    gboolean ok = aa_candidate_scan_preview(&u->config, u->history, &result, &error);
+    if (!ok || (result.status != AA_CANDIDATE_READY &&
+                result.status != AA_CANDIDATE_TOO_OLD)) {
+        aa_log_append(u->journal, error ? error->message :
+            (result.detail ? result.detail : "Aucun patch admissible à appliquer."));
+    } else {
+        gboolean expired = result.status == AA_CANDIDATE_TOO_OLD;
+        gboolean attempted = aa_history_needs_confirmation(u->history, result.filename);
+        if (expired || attempted) {
+            /* Expiration or a previous failed attempt needs explicit Yes/No. */
+            request_approval(u, result.filename, result.number, FALSE, attempted, TRUE, expired);
+        } else {
+            /* Clicking Apply patch is the explicit consent for a fresh file. */
+            execute_selected(u, result.filename, result.number, FALSE, FALSE);
+        }
+    }
+    aa_candidate_result_clear(&result);
+    if (!u->watcher && !u->executor && !u->pending_name && u->history) {
+        aa_history_free(u->history);
+        u->history = NULL;
+    }
+    schedule_candidate_refresh(u);
 }
 
 static gboolean scan_candidates(gpointer data) {
@@ -463,9 +659,9 @@ static gboolean scan_candidates(gpointer data) {
         gboolean quota = u->config.automatic && u->config.auto_limit > 0 &&
                          u->auto_success_count >= u->config.auto_limit;
         if (u->config.automatic && !quota && !previous)
-            execute_selected(u, result.filename, result.number, TRUE);
+            execute_selected(u, result.filename, result.number, TRUE, FALSE);
         else
-            request_approval(u, result.filename, result.number, quota, previous);
+            request_approval(u, result.filename, result.number, quota, previous, FALSE, FALSE);
     }
     aa_candidate_result_clear(&result);
     return G_SOURCE_REMOVE;
@@ -480,7 +676,10 @@ static void schedule_scan(Ui *u) {
 
 static void on_file(const char *filename, gpointer data) {
     Ui *u = data;
-    if (aa_matcher_matches(&u->config, filename)) schedule_scan(u);
+    if (aa_matcher_matches(&u->config, filename)) {
+        schedule_scan(u);
+        schedule_candidate_refresh(u);
+    }
 }
 
 static void stop_watcher(Ui *u) {
@@ -492,7 +691,7 @@ static void stop_watcher(Ui *u) {
         aa_watcher_stop(u->watcher);
         u->watcher = NULL;
     }
-    if (!u->executor) {
+    if (!u->executor && !u->pending_from_button) {
         aa_history_free(u->history);
         u->history = NULL;
     }
@@ -500,6 +699,7 @@ static void stop_watcher(Ui *u) {
     if (!u->executor) gtk_widget_set_sensitive(u->settings_box, TRUE);
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Démarrer");
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance arrêtée");
+    schedule_candidate_refresh(u);
 }
 
 static void on_start(GtkButton *button, gpointer data) {
@@ -545,6 +745,7 @@ static void on_start(GtkButton *button, gpointer data) {
         u->config.automatic ? "Mode AUTOMATIQUE activé : Python peut modifier ton projet sans validation, Git inactif."
                             : "Mode MANUEL : confirmation avant chaque exécution Python, Git inactif.");
     schedule_scan(u); /* Also inspect files that arrived just before Start. */
+    schedule_candidate_refresh(u);
 }
 
 static void on_cancel_running(GtkButton *button, gpointer data) {
@@ -567,6 +768,14 @@ static gboolean on_close(GtkWindow *window, gpointer data) {
         return TRUE; /* Keep the UI alive until async callbacks have completed. */
     }
     stop_watcher(u);
+    if (u->preview_source) g_source_remove(u->preview_source);
+    if (u->expiry_source) g_source_remove(u->expiry_source);
+    if (u->preview_monitor) {
+        g_signal_handlers_disconnect_by_data(u->preview_monitor, u);
+        g_file_monitor_cancel(u->preview_monitor);
+        g_clear_object(&u->preview_monitor);
+    }
+    g_free(u->preview_watch_dir);
     collect(u);
     GtkWidget *entries[] = {u->watch_entry, u->project_entry, u->regex_entry,
         u->prefix_entry, u->suffix_entry, u->extension_entry, u->number_regex_entry};
@@ -618,6 +827,12 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     u->start_button = gtk_button_new_with_label("Démarrer");
     gtk_box_append(GTK_BOX(toolbar), u->start_button);
     g_signal_connect(u->start_button, "clicked", G_CALLBACK(on_start), u);
+    u->apply_button = gtk_button_new_with_label("Apply patch");
+    gtk_widget_set_sensitive(u->apply_button, FALSE);
+    gtk_widget_set_tooltip_text(u->apply_button,
+        "Applique manuellement le fichier détecté, même si la surveillance est arrêtée.");
+    gtk_box_append(GTK_BOX(toolbar), u->apply_button);
+    g_signal_connect(u->apply_button, "clicked", G_CALLBACK(on_apply_patch), u);
     u->cancel_button = gtk_button_new_with_label("Interrompre Python");
     gtk_widget_set_sensitive(u->cancel_button, FALSE);
     gtk_box_append(GTK_BOX(toolbar), u->cancel_button);
@@ -717,6 +932,11 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     gtk_label_set_wrap(GTK_LABEL(u->preview), TRUE);
     gtk_label_set_selectable(GTK_LABEL(u->preview), TRUE);
     gtk_box_append(GTK_BOX(footer), u->preview);
+    u->candidate_label = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(u->candidate_label), 0);
+    gtk_label_set_wrap(GTK_LABEL(u->candidate_label), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(u->candidate_label), TRUE);
+    gtk_box_append(GTK_BOX(footer), u->candidate_label);
     u->preview_extra = gtk_label_new(NULL);
     gtk_widget_add_css_class(u->preview_extra, "dim-label");
     gtk_label_set_xalign(GTK_LABEL(u->preview_extra), 0);

@@ -90,3 +90,24 @@ L'aperçu affichera : `^patch_(?:[0-9]{4})_fix\.py$` (avec un seul antislash dan
   malveillant (limitation POSIX). Ne surveille pas de dossiers non fiables.
 - Git automatique n'est pas encore implémenté : lorsque Git sera activé,
   supprimer la source devra rester conditionné au succès du workflow final.
+
+## Patch 004c — aperçu du candidat et exécution manuelle
+
+- Une ligne `DETECTED FILENAME` sous `EXPECTED FILENAME` montre le candidat non appliqué.
+  **Bleu** : candidat récent ; **orange** : fichier dépassant `max_age` ;
+  **rouge** : ambiguïté, erreur de numérotation ou séquence invalide.
+- `Apply patch` fonctionne même lorsque Start/Stop est arrêté. Sur un fichier
+  récent, le clic valide directement l'exécution. Pour un fichier ancien, une
+  boîte de dialogue explicite `No` / `Yes` (par défaut `No`) demande de passer
+  outre **uniquement** le filtre d'âge. Un script précédemment tenté exige
+  aussi une nouvelle confirmation.
+- Les filtres regex, l'unicité du candidat (à âge comparable), les liens
+  symboliques et l'ordre numérique restent contrôlés juste avant exécution.
+  L'automatisation ne sélectionne jamais un fichier trop ancien.
+- L'aperçu se met à jour via `GFileMonitor` sans polling, y compris lorsque la
+  surveillance automatique est arrêtée ; un timer unique gère l'expiration.
+- En présence de plusieurs fichiers anciens, l'interface affiche l'ambiguïté
+  et refuse leur exécution. Les anciens fichiers sont exclus du scan auto normal.
+
+**Sécurité** : `Apply patch` lance du code Python avec les privilèges complets
+de l'utilisateur. Effectuer les premiers essais sur un dépôt jetable.

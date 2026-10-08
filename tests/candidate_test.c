@@ -149,6 +149,37 @@ static void test_age_and_numbers(Fixture *f, gconstpointer data) {
     aa_history_free(h);
 }
 
+static void test_expired_preview(Fixture *f, gconstpointer data) {
+    (void)data;
+    AaHistory *h = open_history(f);
+    touch(f, "patch_0001.py");
+    g_autofree char *old_path = g_build_filename(f->watch, "patch_0001.py", NULL);
+    struct utimbuf old = {.actime = 1000000000, .modtime = 1000000000};
+    g_assert_cmpint(utime(old_path, &old), ==, 0);
+    AaCandidateResult result = {0};
+    g_assert_true(aa_candidate_scan_preview(&f->cfg, h, &result, NULL));
+    g_assert_cmpint(result.status, ==, AA_CANDIDATE_TOO_OLD);
+    g_assert_cmpstr(result.filename, ==, "patch_0001.py");
+    g_assert_cmpint(result.age_seconds, >, f->cfg.max_age);
+    aa_candidate_result_clear(&result);
+
+    touch(f, "patch_0002.py");
+    result = scan(f, h);
+    g_assert_cmpint(result.status, ==, AA_CANDIDATE_READY);
+    aa_candidate_result_clear(&result);
+    g_assert_true(aa_candidate_scan_preview(&f->cfg, h, &result, NULL));
+    g_assert_cmpstr(result.filename, ==, "patch_0002.py");
+    g_assert_cmpint(result.status, ==, AA_CANDIDATE_READY);
+    aa_candidate_result_clear(&result);
+
+    g_autofree char *fresh_path = g_build_filename(f->watch, "patch_0002.py", NULL);
+    g_assert_cmpint(utime(fresh_path, &old), ==, 0);
+    g_assert_true(aa_candidate_scan_preview(&f->cfg, h, &result, NULL));
+    g_assert_cmpint(result.status, ==, AA_CANDIDATE_AMBIGUOUS);
+    aa_candidate_result_clear(&result);
+    aa_history_free(h);
+}
+
 static void test_symlink(Fixture *f, gconstpointer data) {
     (void)data;
     AaHistory *h = open_history(f);
@@ -166,5 +197,6 @@ int main(int argc, char **argv) {
     g_test_add("/candidates/ambiguous", Fixture, NULL, fixture_setup, test_ambiguity, fixture_teardown);
     g_test_add("/candidates/age-and-number", Fixture, NULL, fixture_setup, test_age_and_numbers, fixture_teardown);
     g_test_add("/candidates/no-symlinks", Fixture, NULL, fixture_setup, test_symlink, fixture_teardown);
+    g_test_add("/candidates/expired-preview", Fixture, NULL, fixture_setup, test_expired_preview, fixture_teardown);
     return g_test_run();
 }
