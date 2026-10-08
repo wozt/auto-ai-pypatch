@@ -61,6 +61,7 @@ gboolean aa_config_load(AaConfig *c, GError **error) {
     c->numbering = get_bool(key, "numbering", c->numbering);
     c->automatic = get_bool(key, "automatic", c->automatic);
     c->git_enabled = get_bool(key, "git_enabled", c->git_enabled);
+    c->delete_after_success = get_bool(key, "delete_after_success", c->delete_after_success);
     c->max_age = get_uint(key, "max_age", c->max_age);
     c->auto_limit = get_uint(key, "auto_limit", c->auto_limit);
     return TRUE;
@@ -77,6 +78,7 @@ gboolean aa_config_save(const AaConfig *c, GError **error) {
     g_key_file_set_boolean(key, "settings", "numbering", c->numbering);
     g_key_file_set_boolean(key, "settings", "automatic", c->automatic);
     g_key_file_set_boolean(key, "settings", "git_enabled", c->git_enabled);
+    g_key_file_set_boolean(key, "settings", "delete_after_success", c->delete_after_success);
     g_key_file_set_uint64(key, "settings", "max_age", c->max_age);
     g_key_file_set_uint64(key, "settings", "auto_limit", c->auto_limit);
     g_autofree char *path = config_file();

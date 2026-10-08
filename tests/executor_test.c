@@ -14,6 +14,10 @@ typedef struct {
     gboolean success;
     int exit_code;
     gboolean completed;
+    gboolean remove_requested;
+    gboolean tamper_source;
+    gboolean removal_succeeded;
+    char *source_path;
 } Execution;
 
 static void output_cb(const char *line, gboolean err, gpointer data) {
@@ -26,6 +30,17 @@ static void complete_cb(gboolean success, int code, const char *msg, gpointer da
     run->success = success;
     run->exit_code = code;
     run->completed = TRUE;
+    if (run->remove_requested) {
+        if (run->tamper_source)
+            g_assert_true(g_file_set_contents(run->source_path,
+                "# downloaded script replaced before removal\n", -1, NULL));
+        g_autoptr(GError) error = NULL;
+        run->removal_succeeded = aa_executor_remove_source(run->executor, &error);
+        if (success && !run->tamper_source)
+            g_assert_no_error(error);
+        else
+            g_assert_nonnull(error);
+    }
     run->executor = NULL;
     g_main_loop_quit(run->loop);
 }
@@ -36,8 +51,11 @@ static gboolean timeout_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 static void run_python(const char *watch, const char *basename, const char *project,
-                       gboolean expected_success, const char *expected_output) {
-    Execution run = {.loop = g_main_loop_new(NULL, FALSE), .output = g_string_new(NULL)};
+                       gboolean expected_success, const char *expected_output,
+                       gboolean remove_requested, gboolean tamper_source) {
+    Execution run = {.loop = g_main_loop_new(NULL, FALSE), .output = g_string_new(NULL),
+                     .remove_requested = remove_requested, .tamper_source = tamper_source,
+                     .source_path = g_build_filename(watch, basename, NULL)};
     g_autoptr(GError) error = NULL;
     run.executor = aa_executor_start(watch, basename, project, output_cb, complete_cb, &run, &error);
     g_assert_no_error(error);
@@ -48,6 +66,10 @@ static void run_python(const char *watch, const char *basename, const char *proj
     g_assert_true(run.completed);
     g_assert_cmpint(run.success, ==, expected_success);
     g_assert_nonnull(strstr(run.output->str, expected_output));
+    g_assert_cmpint(run.removal_succeeded, ==, expected_success && remove_requested && !tamper_source);
+    g_assert_cmpint(g_file_test(run.source_path, G_FILE_TEST_EXISTS), ==,
+                    !run.removal_succeeded);
+    g_free(run.source_path);
     g_string_free(run.output, TRUE);
     g_main_loop_unref(run.loop);
 }
@@ -64,22 +86,30 @@ static void test_runner(void) {
     g_assert_cmpint(g_mkdir(watch, 0700), ==, 0);
     g_assert_cmpint(g_mkdir(project, 0700), ==, 0);
     write_patch(watch, "patch_ok.py", "import pathlib,sys\nprint('output-ok',flush=True)\nprint('err-ok',file=sys.stderr,flush=True)\npathlib.Path('changed.txt').write_text('modified')\n");
-    run_python(watch, "patch_ok.py", project, TRUE, "OUT:output-ok");
+    run_python(watch, "patch_ok.py", project, TRUE, "OUT:output-ok", TRUE, FALSE);
     g_autofree char *changed = g_build_filename(project, "changed.txt", NULL);
     g_assert_true(g_file_test(changed, G_FILE_TEST_EXISTS));
+    write_patch(watch, "patch_keep.py", "print('keep-me')\n");
+    run_python(watch, "patch_keep.py", project, TRUE, "OUT:keep-me", FALSE, FALSE);
+    write_patch(watch, "patch_modified.py", "print('patched')\n");
+    run_python(watch, "patch_modified.py", project, TRUE, "OUT:patched", TRUE, TRUE);
     write_patch(watch, "patch_fail.py", "import sys\nprint('exit-failed',file=sys.stderr)\nsys.exit(7)\n");
-    run_python(watch, "patch_fail.py", project, FALSE, "ERR:exit-failed");
+    run_python(watch, "patch_fail.py", project, FALSE, "ERR:exit-failed", TRUE, FALSE);
     g_autofree char *link_path = g_build_filename(watch, "patch_link.py", NULL);
     g_autofree char *original = g_build_filename(watch, "patch_ok.py", NULL);
-    g_assert_cmpint(symlink("patch_ok.py", link_path), ==, 0);
+    g_assert_cmpint(symlink("patch_keep.py", link_path), ==, 0);
     AaExecutor *unsafe = aa_executor_start(watch, "patch_link.py", project, NULL, NULL, NULL, &error);
     g_assert_null(unsafe);
     g_assert_nonnull(error);
     g_clear_error(&error);
     g_assert_cmpint(g_remove(link_path), ==, 0);
-    g_assert_cmpint(g_remove(original), ==, 0);
+    g_assert_false(g_file_test(original, G_FILE_TEST_EXISTS)); /* Deleted on success. */
+    g_autofree char *keep = g_build_filename(watch, "patch_keep.py", NULL);
+    g_autofree char *modified = g_build_filename(watch, "patch_modified.py", NULL);
+    g_assert_cmpint(g_remove(keep), ==, 0);
+    g_assert_cmpint(g_remove(modified), ==, 0);
     g_autofree char *fail = g_build_filename(watch, "patch_fail.py", NULL);
-    g_remove(fail);
+    g_assert_cmpint(g_remove(fail), ==, 0);
     g_remove(changed);
     g_rmdir(project);
     g_rmdir(watch);

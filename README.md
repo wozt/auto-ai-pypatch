@@ -72,3 +72,21 @@ L'aperçu affichera : `^patch_(?:[0-9]{4})_fix\.py$` (avec un seul antislash dan
 - **IMPORTANT:** Scripts execute with the full privileges of your user account,
   **without any sandbox**. Never auto-run downloaded code from untrusted sources.
   `Git add/commit/push` remains disabled until a later phase.
+
+## Phase 4b — Suppression facultative des patchs téléchargés
+
+- Paramètre **Supprimer le patch après exécution réussie**, désactivé par défaut et
+  conservé dans `~/.config/auto-ai-pypatch/config.ini` (`delete_after_success=true/false`).
+- Le téléchargement original n'est supprimé **qu'après** fin Python `exit 0`
+  **et** persistance de l'historique des patchs appliqués. Le snapshot privé
+  utilisé pour l'exécution est supprimé indépendamment de cette option.
+- Aucun effacement sur échec, interruption, erreur d'historique ou absence de
+  fichier original. Si le fichier a été remplacé/modifié, le journal indique
+  pourquoi il a été conservé. L'échec de suppression ne réexécute pas un patch
+  déjà appliqué.
+- Le dossier est tenu ouvert pendant l'exécution et les métadonnées, l'inode
+  ainsi que le SHA-256 sont vérifiés avant suppression. Cela ne constitue pas
+  une suppression conditionnelle atomique face à un processus concurrent
+  malveillant (limitation POSIX). Ne surveille pas de dossiers non fiables.
+- Git automatique n'est pas encore implémenté : lorsque Git sera activé,
+  supprimer la source devra rester conditionné au succès du workflow final.

@@ -26,6 +26,10 @@ struct AaExecutor {
     gpointer user_data;
     gchar *stage_dir;
     gchar *stage_file;
+    int watch_fd; /* Pin watched directory across execution, including symlinked folders. */
+    gchar *source_basename;
+    gchar *source_sha256;
+    struct stat source_stat;
     gboolean wait_done;
     gboolean wait_ok;
     gboolean interrupted;
@@ -37,11 +41,14 @@ struct AaExecutor {
 static void executor_free(AaExecutor *e) {
     if (e->stage_file) g_remove(e->stage_file);
     if (e->stage_dir) g_rmdir(e->stage_dir);
+    if (e->watch_fd >= 0) close(e->watch_fd);
     g_clear_object(&e->process);
     if (e->stdout_stream.pending) g_string_free(e->stdout_stream.pending, TRUE);
     if (e->stderr_stream.pending) g_string_free(e->stderr_stream.pending, TRUE);
     g_free(e->stage_file);
     g_free(e->stage_dir);
+    g_free(e->source_basename);
+    g_free(e->source_sha256);
     g_free(e);
 }
 
@@ -131,11 +138,16 @@ static gboolean copy_snapshot(AaExecutor *e, const char *watch_dir,
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_FILENAME, "Nom de fichier invalide.");
         return FALSE;
     }
-    g_autofree gchar *path = g_build_filename(watch_dir, basename, NULL);
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    e->watch_fd = open(watch_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (e->watch_fd < 0) {
+        g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
+                    "Impossible d'ouvrir le dossier surveillé %s : %s", watch_dir, g_strerror(errno));
+        return FALSE;
+    }
+    int fd = openat(e->watch_fd, basename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
-                    "Impossible d'ouvrir %s : %s", path, g_strerror(errno));
+                    "Impossible d'ouvrir %s : %s", basename, g_strerror(errno));
         return FALSE;
     }
     struct stat before, after;
@@ -168,6 +180,11 @@ static gboolean copy_snapshot(AaExecutor *e, const char *watch_dir,
                             "Téléchargement modifié pendant la lecture ; exécution refusée.");
         return FALSE;
     }
+    /* Pin both file identity and exact bytes of the immutable execution snapshot.
+       The optional cleanup must never unlink a newer download with the same name. */
+    e->source_stat = after;
+    e->source_basename = g_strdup(basename);
+    e->source_sha256 = g_compute_checksum_for_data(G_CHECKSUM_SHA256, contents->data, contents->len);
     e->stage_dir = g_dir_make_tmp("auto-ai-pypatch-XXXXXX", error);
     if (!e->stage_dir) return FALSE;
     e->stage_file = g_build_filename(e->stage_dir, "patch.py", NULL);
@@ -183,6 +200,7 @@ AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
         return NULL;
     }
     AaExecutor *e = g_new0(AaExecutor, 1);
+    e->watch_fd = -1;
     e->output = output;
     e->finished = finished;
     e->user_data = data;
@@ -212,4 +230,72 @@ void aa_executor_cancel(AaExecutor *e) {
     if (!e || e->interrupted) return;
     e->interrupted = TRUE;
     g_subprocess_force_exit(e->process);
+}
+
+/* Only callable from AaExecutorFinished while the executor is still alive.
+ * Best-effort inode/metadata/hash identity check before unlinkat(). POSIX does
+ * not offer a conditional unlink operation; this is not a security sandbox
+ * against a malicious concurrent process mutating the watched directory.
+ */
+static gboolean source_stat_matches(const struct stat *saved, const struct stat *now) {
+    return S_ISREG(now->st_mode) && saved->st_dev == now->st_dev &&
+        saved->st_ino == now->st_ino && saved->st_size == now->st_size &&
+        saved->st_mtim.tv_sec == now->st_mtim.tv_sec &&
+        saved->st_mtim.tv_nsec == now->st_mtim.tv_nsec &&
+        saved->st_ctim.tv_sec == now->st_ctim.tv_sec &&
+        saved->st_ctim.tv_nsec == now->st_ctim.tv_nsec;
+}
+
+gboolean aa_executor_remove_source(AaExecutor *e, GError **error) {
+    g_return_val_if_fail(e != NULL, FALSE);
+    if (e->watch_fd < 0 || !e->source_basename || !e->source_sha256 ||
+        !e->wait_done || !e->wait_ok || e->interrupted || e->exit_code != 0 ||
+        !g_subprocess_get_if_exited(e->process)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Suppression refusée : aucune exécution Python réussie.");
+        return FALSE;
+    }
+    int fd = openat(e->watch_fd, e->source_basename,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
+                    "Source inaccessible (déplacée ou remplacée) : %s", g_strerror(errno));
+        return FALSE;
+    }
+    struct stat before, after, path_stat;
+    gboolean unchanged = fstat(fd, &before) == 0 &&
+        source_stat_matches(&e->source_stat, &before);
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    gsize total = 0;
+    guint8 chunk[16384];
+    while (unchanged) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { unchanged = FALSE; break; }
+        if (n == 0) break;
+        total += (gsize)n;
+        if (total > AA_MAX_PATCH_BYTES || total > (gsize)e->source_stat.st_size) {
+            unchanged = FALSE;
+            break;
+        }
+        g_checksum_update(checksum, chunk, (gsize)n);
+    }
+    unchanged = unchanged && total == (gsize)e->source_stat.st_size &&
+        g_strcmp0(g_checksum_get_string(checksum), e->source_sha256) == 0 &&
+        fstat(fd, &after) == 0 && source_stat_matches(&e->source_stat, &after) &&
+        fstatat(e->watch_fd, e->source_basename, &path_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+        source_stat_matches(&e->source_stat, &path_stat);
+    g_checksum_free(checksum);
+    close(fd);
+    if (!unchanged) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
+            "Le fichier téléchargé a changé ou a été remplacé : suppression ignorée.");
+        return FALSE;
+    }
+    if (unlinkat(e->watch_fd, e->source_basename, 0) != 0) {
+        g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
+                    "Suppression du téléchargement impossible : %s", g_strerror(errno));
+        return FALSE;
+    }
+    return TRUE;
 }

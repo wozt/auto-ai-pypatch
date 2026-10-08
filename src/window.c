@@ -35,7 +35,7 @@ typedef struct {
     GtkWidget *watch_entry, *project_entry, *regex_entry, *prefix_entry;
     GtkWidget *suffix_entry, *extension_entry, *number_regex_entry;
     GtkWidget *age_spin, *limit_spin, *numbering_switch;
-    GtkWidget *auto_switch, *git_switch, *language;
+    GtkWidget *auto_switch, *git_switch, *delete_switch, *language;
     GtkWidget *preview, *preview_extra, *number_examples;
 } Ui;
 
@@ -151,6 +151,7 @@ static void collect(Ui *u) {
     u->config.numbering = gtk_switch_get_active(GTK_SWITCH(u->numbering_switch));
     u->config.automatic = gtk_switch_get_active(GTK_SWITCH(u->auto_switch));
     u->config.git_enabled = gtk_switch_get_active(GTK_SWITCH(u->git_switch));
+    u->config.delete_after_success = gtk_switch_get_active(GTK_SWITCH(u->delete_switch));
     u->config.max_age = (guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(u->age_spin));
     u->config.auto_limit = (guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(u->limit_spin));
 }
@@ -346,7 +347,8 @@ static void execute_selected(Ui *u, const char *filename, guint64 number,
 
 static void on_executor_finished(gboolean success, int exit_code, const char *message, gpointer data) {
     Ui *u = data;
-    u->executor = NULL; /* executor destroys itself after this callback returns. */
+    AaExecutor *completed = u->executor; /* Valid only until this callback returns. */
+    u->executor = NULL; /* Executor destroys itself after this callback returns. */
     gtk_widget_set_sensitive(u->cancel_button, FALSE);
     gtk_widget_set_sensitive(u->settings_box, !u->watcher);
     g_autofree gchar *msg = g_strdup_printf("%s : %s", success ? "SUCCÈS" : "ÉCHEC", message);
@@ -358,8 +360,24 @@ static void on_executor_finished(gboolean success, int exit_code, const char *me
             g_autofree gchar *failure = g_strdup_printf("Historique d'application NON enregistré : %s", error->message);
             aa_log_append(u->journal, failure);
             success = FALSE;
-        } else if (u->running_automatic && u->auto_success_count < G_MAXUINT) {
-            u->auto_success_count++;
+        } else {
+            if (u->running_automatic && u->auto_success_count < G_MAXUINT)
+                u->auto_success_count++;
+            /* Only remove the downloaded source after durable applied history.
+               A replaced or modified file is NEVER intentionally deleted. */
+            if (u->config.delete_after_success && completed) {
+                g_autoptr(GError) remove_error = NULL;
+                if (aa_executor_remove_source(completed, &remove_error)) {
+                    g_autofree gchar *removed = g_strdup_printf(
+                        "Patch téléchargé supprimé après succès : %s", u->running_name);
+                    aa_log_append(u->journal, removed);
+                } else {
+                    g_autofree gchar *warning = g_strdup_printf(
+                        "Patch appliqué, mais source conservée : %s",
+                        remove_error ? remove_error->message : "suppression refusée");
+                    aa_log_append(u->journal, warning);
+                }
+            }
         }
     }
     g_clear_pointer(&u->running_name, g_free);
@@ -676,6 +694,9 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     gtk_widget_set_tooltip_text(u->auto_switch,
         "ATTENTION : ces scripts Python disposent de tous les droits de ton compte utilisateur.");
     u->git_switch = switch_row(settings, "Git add/commit/push (patch 005)", u->config.git_enabled);
+    u->delete_switch = switch_row(settings, "Supprimer le patch après exécution réussie", u->config.delete_after_success);
+    gtk_widget_set_tooltip_text(u->delete_switch,
+        "Option désactivée par défaut. Ne supprime que le fichier téléchargé inchangé après Python exit 0 et sauvegarde de l'historique.");
     gtk_widget_set_sensitive(u->git_switch, FALSE);
 
     GtkWidget *right_scroll = gtk_scrolled_window_new();

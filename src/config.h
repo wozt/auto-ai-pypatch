@@ -13,6 +13,7 @@ typedef struct {
     gboolean numbering;
     gboolean automatic;
     gboolean git_enabled;
+    gboolean delete_after_success;
     guint max_age;
     guint auto_limit;
 } AaConfig;

@@ -17,3 +17,9 @@ AaExecutor *aa_executor_start(const char *watch_dir, const char *basename,
                               GError **error);
 /* Interrupt the Python process, and finish asynchronously. */
 void aa_executor_cancel(AaExecutor *executor);
+/* Optionally delete the exact downloaded source after exit 0 AND successful
+ * applied-history persistence. Call only from AaExecutorFinished, before
+ * the executor is freed; refuse changed/replaced files or unsuccessful runs.
+ * Uses best-effort identity validation, not atomic conditional unlink.
+ */
+gboolean aa_executor_remove_source(AaExecutor *executor, GError **error);
