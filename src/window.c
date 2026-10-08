@@ -148,7 +148,7 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     g_autoptr(GError) error = NULL;
     if (!aa_config_load(&u->config, &error)) g_warning("Config load: %s", error->message);
 
-    u->window = adw_application_window_new(app);
+    u->window = adw_application_window_new(GTK_APPLICATION(app));
     gtk_window_set_title(GTK_WINDOW(u->window), "Auto-AI-PyPatch");
     gtk_window_set_default_size(GTK_WINDOW(u->window), 1100, 780);
     g_signal_connect(u->window, "destroy", G_CALLBACK(on_close), u);
