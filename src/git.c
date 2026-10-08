@@ -102,7 +102,10 @@ static void git_step_completed(GObject *source, GAsyncResult *res, gpointer user
     g_autofree gchar *err_owned = err;
     int code = communicated && g_subprocess_get_if_exited(g->process) ?
         g_subprocess_get_exit_status(g->process) : -1;
-    if (out && *out && g->output) {
+    /* Do not show git commit hash/message on successful commits.
+     * Preserve stdout when commit fails, and preserve all stderr. */
+    if (out && *out && g->output &&
+        !(g->step == AA_GIT_COMMIT && communicated && code == 0)) {
         g_autofree gchar *line = g_strndup(out, 8192);
         g->output(line, g->data);
     }
@@ -117,6 +120,8 @@ static void git_step_completed(GObject *source, GAsyncResult *res, gpointer user
         git_finish(g, FALSE, message);
         return;
     }
+    if (g->step == AA_GIT_COMMIT && g->output)
+        g->output("git commit : OK", g->data);
     if (g->step == AA_GIT_DIFF && code == 0) {
         if (g->output) g->output("Aucun changement nouveau ; vérification du push.", g->data);
         g->step = AA_GIT_PUSH;
@@ -147,7 +152,8 @@ static gboolean git_launch(AaGit *g, GError **error) {
     g_subprocess_launcher_setenv(launcher, "GIT_SSH_COMMAND", "ssh -o BatchMode=yes", TRUE);
     g->process = g_subprocess_launcher_spawnv(launcher, args, error);
     if (!g->process) return FALSE;
-    if (g->output) g->output(step_label(g->step), g->data);
+    if (g->output && g->step != AA_GIT_COMMIT)
+        g->output(step_label(g->step), g->data);
     g_subprocess_communicate_utf8_async(g->process, NULL, NULL, git_step_completed, g);
     return TRUE;
 }

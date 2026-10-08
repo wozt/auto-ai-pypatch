@@ -1027,6 +1027,6 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     g_signal_connect(u->age_spin, "value-changed", G_CALLBACK(on_age_changed), u);
     update_preview(u);
     on_prompt(NULL, u);
-    aa_log_append(u->journal, "Phase 4 : exécution Python avec confirmation/quota et historique appliqué. Git désactivé.");
+    aa_log_append(u->journal, "Auto-AI-PyPatch prêt : Python et Git selon les options configurées.");
     return u->window;
 }
