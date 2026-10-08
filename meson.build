@@ -8,6 +8,7 @@ sources = files(
   'src/main.c', 'src/window.c', 'src/config.c', 'src/watcher.c',
   'src/prompt.c', 'src/log.c', 'src/matcher.c', 'src/executor.c',
   'src/git.c', 'src/patch_meta.c', 'src/history.c',
+  'src/candidate.c',
 )
 
 executable('auto-ai-pypatch', sources, dependencies: [gtk, adw, gio], install: true)

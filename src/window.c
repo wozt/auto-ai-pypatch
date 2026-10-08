@@ -3,12 +3,17 @@
 #include "watcher.h"
 #include "prompt.h"
 #include "matcher.h"
+#include "candidate.h"
+#include "history.h"
 #include "log.h"
 #include <gio/gio.h>
 
 typedef struct {
     AaConfig config;
     AaWatcher *watcher;
+    AaHistory *history;
+    guint scan_source;
+    char *last_problem;
     GtkWidget *window;
     GtkWidget *start_button;
     GtkWidget *status;
@@ -20,6 +25,9 @@ typedef struct {
     GtkWidget *auto_switch, *git_switch, *language;
     GtkWidget *preview, *preview_extra, *number_examples;
 } Ui;
+
+static void stop_watcher(Ui *u);
+static void schedule_scan(Ui *u);
 
 static GtkWidget *entry_row(GtkWidget *parent, const char *label, const char *value) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -158,11 +166,31 @@ static void update_preview(Ui *u) {
 
 static void on_field_changed(GtkEditable *editable, gpointer data) {
     (void)editable;
-    update_preview(data);
+    Ui *u = data;
+    if (u->watcher) {
+        stop_watcher(u);
+        aa_log_append(u->journal, "Filtres modifiés : surveillance arrêtée, relance-la.");
+    }
+    update_preview(u);
 }
+
+static void on_age_changed(GtkSpinButton *spin, gpointer data) {
+    (void)spin;
+    Ui *u = data;
+    if (u->watcher) {
+        stop_watcher(u);
+        aa_log_append(u->journal, "Âge maximal modifié : surveillance arrêtée, relance-la.");
+    }
+}
+
 static void on_numbering_changed(GObject *switch_obj, GParamSpec *pspec, gpointer data) {
     (void)switch_obj; (void)pspec;
-    update_preview(data);
+    Ui *u = data;
+    if (u->watcher) {
+        stop_watcher(u);
+        aa_log_append(u->journal, "Numérotation modifiée : surveillance arrêtée, relance-la.");
+    }
+    update_preview(u);
 }
 
 static const char *const filename_examples[] = {
@@ -243,18 +271,74 @@ static void on_copy(GtkButton *button, gpointer data) {
     aa_log_append(u->journal, "Prompt copié.");
 }
 
+static void log_problem(Ui *u, const char *detail) {
+    if (g_strcmp0(detail, u->last_problem) == 0) return;
+    g_free(u->last_problem);
+    u->last_problem = g_strdup(detail);
+    aa_log_append(u->journal, detail);
+    gtk_label_set_text(GTK_LABEL(u->status), "Surveillance : intervention nécessaire");
+}
+
+static gboolean scan_candidates(gpointer data) {
+    Ui *u = data;
+    u->scan_source = 0;
+    if (!u->watcher || !u->history) return G_SOURCE_REMOVE;
+    AaCandidateResult result = {0};
+    g_autoptr(GError) error = NULL;
+    if (!aa_candidate_scan(&u->config, u->history, &result, &error)) {
+        g_autofree char *msg = g_strdup_printf("Erreur de lecture du dossier : %s", error->message);
+        log_problem(u, msg);
+        aa_candidate_result_clear(&result);
+        return G_SOURCE_REMOVE;
+    }
+    if (result.status == AA_CANDIDATE_NONE) {
+        g_clear_pointer(&u->last_problem, g_free);
+        gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
+    } else if (result.status != AA_CANDIDATE_READY) {
+        log_problem(u, result.detail ? result.detail : "Fichier non conforme.");
+    } else {
+        if (!aa_history_record_preview(u->history, result.filename,
+                                       u->config.numbering, result.number, &error)) {
+            g_autofree char *msg = g_strdup_printf("Historique non enregistré : %s", error->message);
+            log_problem(u, msg);
+        } else {
+            g_clear_pointer(&u->last_problem, g_free);
+            g_autofree char *msg = u->config.numbering
+                ? g_strdup_printf("VALIDÉ EN SIMULATION : %s (numéro %" G_GUINT64_FORMAT
+                                  "). Aucun script exécuté.", result.filename, result.number)
+                : g_strdup_printf("VALIDÉ EN SIMULATION : %s. Aucun script exécuté.", result.filename);
+            aa_log_append(u->journal, msg);
+            gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
+        }
+    }
+    aa_candidate_result_clear(&result);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_scan(Ui *u) {
+    if (!u->watcher || u->scan_source) return;
+    /* Coalesce close-write/move bursts so two simultaneous downloads are
+       evaluated together rather than being accepted one after the other. */
+    u->scan_source = g_timeout_add(400, scan_candidates, u);
+}
+
 static void on_file(const char *filename, gpointer data) {
     Ui *u = data;
-    if (!aa_matcher_matches(&u->config, filename)) return;
-    g_autofree char *message = g_strdup_printf(
-        "Fichier correspondant aux filtres : %s (détection uniquement ; exécution désactivée)", filename);
-    aa_log_append(u->journal, message);
+    if (aa_matcher_matches(&u->config, filename)) schedule_scan(u);
 }
 
 static void stop_watcher(Ui *u) {
-    if (!u->watcher) return;
-    aa_watcher_stop(u->watcher);
-    u->watcher = NULL;
+    if (u->scan_source) {
+        g_source_remove(u->scan_source);
+        u->scan_source = 0;
+    }
+    if (u->watcher) {
+        aa_watcher_stop(u->watcher);
+        u->watcher = NULL;
+    }
+    aa_history_free(u->history);
+    u->history = NULL;
+    g_clear_pointer(&u->last_problem, g_free);
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Démarrer");
     gtk_label_set_text(GTK_LABEL(u->status), "Surveillance arrêtée");
 }
@@ -270,36 +354,47 @@ static void on_start(GtkButton *button, gpointer data) {
     collect(u);
     g_autoptr(GError) error = NULL;
     if (!aa_matcher_validate(&u->config, &error)) {
-        g_autofree char *message = g_strdup_printf("Erreur de regex : %s", error->message);
-        aa_log_append(u->journal, message);
+        g_autofree char *msg = g_strdup_printf("Regex invalide : %s", error->message);
+        aa_log_append(u->journal, msg);
         return;
     }
     if (!g_file_test(u->config.watch_dir, G_FILE_TEST_IS_DIR) ||
         !g_file_test(u->config.project_dir, G_FILE_TEST_IS_DIR)) {
-        aa_log_append(u->journal, "Erreur : renseigner deux dossiers existants (surveillance et projet).");
+        aa_log_append(u->journal, "Erreur : sélectionne deux dossiers existants (surveillance et projet).");
+        return;
+    }
+    u->history = aa_history_open(&u->config, &error);
+    if (!u->history) {
+        g_autofree char *msg = g_strdup_printf("Historique inaccessible : %s", error->message);
+        aa_log_append(u->journal, msg);
         return;
     }
     u->watcher = aa_watcher_start(u->config.watch_dir, on_file, u, &error);
     if (!u->watcher) {
         g_autofree char *msg = g_strdup_printf("Surveillance impossible : %s", error->message);
         aa_log_append(u->journal, msg);
+        aa_history_free(u->history);
+        u->history = NULL;
         return;
     }
     gtk_button_set_label(GTK_BUTTON(u->start_button), "Arrêter");
-    gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (aucune exécution)");
-    aa_log_append(u->journal, "Surveillance active : seuls les noms qui passent TOUS les filtres sont journalisés.");
+    gtk_label_set_text(GTK_LABEL(u->status), "Surveillance active (simulation)");
+    aa_log_append(u->journal,
+        "Simulation : sélection unique, âge maximal, séquence et anti-doublon actifs. Python/Git désactivés.");
+    schedule_scan(u); /* Also inspect files that arrived just before Start. */
 }
 
 static gboolean on_close(GtkWindow *window, gpointer data) {
     (void)window;
     Ui *u = data;
-    aa_watcher_stop(u->watcher);
+    stop_watcher(u);
     collect(u);
     GtkWidget *entries[] = {u->watch_entry, u->project_entry, u->regex_entry,
         u->prefix_entry, u->suffix_entry, u->extension_entry, u->number_regex_entry};
     for (guint i = 0; i < G_N_ELEMENTS(entries); i++)
         g_signal_handlers_disconnect_by_data(entries[i], u);
     g_signal_handlers_disconnect_by_data(u->numbering_switch, u);
+    g_signal_handlers_disconnect_by_data(u->age_spin, u);
     g_signal_handlers_disconnect_by_data(u->language, u);
     g_autoptr(GError) error = NULL;
     if (!aa_config_save(&u->config, &error)) g_warning("Config save: %s", error->message);
@@ -443,8 +538,9 @@ GtkWidget *aa_window_new(AdwApplication *app) {
     for (guint i = 0; i < G_N_ELEMENTS(entries); i++)
         g_signal_connect(entries[i], "changed", G_CALLBACK(on_field_changed), u);
     g_signal_connect(u->numbering_switch, "notify::active", G_CALLBACK(on_numbering_changed), u);
+    g_signal_connect(u->age_spin, "value-changed", G_CALLBACK(on_age_changed), u);
     update_preview(u);
     on_prompt(NULL, u);
-    aa_log_append(u->journal, "Interface prête : filtrage des noms actif, exécution Python/Git désactivée.");
+    aa_log_append(u->journal, "Phase 3 : sélection et historique de simulation actifs. Python/Git désactivés.");
     return u->window;
 }

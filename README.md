@@ -38,3 +38,17 @@ meson test -C build --print-errorlogs
 | Regex globale | `^patch_[0-9]{4}_fix\.py$` (mettre un seul antislash dans l'interface) |
 
 L'aperçu affichera : `^patch_(?:[0-9]{4})_fix\.py$` (avec un seul antislash dans l'interface). Ce motif accepte `patch_0001_fix.py` mais pas `patch_1_fix.py`.
+
+## Phase 3 : sélection et historique de simulation
+
+- Le watcher `inotify` groupe les événements rapprochés pendant 400 ms, sans boucle `ls`.
+- Un scan est également lancé au démarrage (âge maximal respecté).
+- Si au moins deux fichiers admissibles **non vus** sont présents : erreur, aucune validation.
+- Un seul candidat entraîne une observation « VALIDÉ EN SIMULATION » et est enregistré pour prévenir les doublons après redémarrage.
+- Numérotation : le premier numéro peut être quelconque ; ensuite, seul `dernier + 1` est accepté. Segment numérique ASCII, limité à 64 bits.
+- `Âge maximal = 0` désactive la limite d'âge. Liens symboliques et répertoires ignorés.
+- Supprimer ou déplacer un candidat débloque automatiquement une situation ambiguë.
+- Modifier un filtre ou l'âge pendant la surveillance provoque son arrêt (redémarrage manuel).
+- Historique de **simulation**, par projet et par filtres : `~/.local/state/auto-ai-pypatch/preview-history.ini`. Pour réinitialiser les essais, arrêter l'app puis déplacer ce fichier.
+
+**Aucun patch Python n'est exécuté et aucun Git automatique n'est lancé** dans cette phase. Le moteur réel devra utiliser un historique d'exécution séparé et revérifier les fichiers juste avant leur exécution.

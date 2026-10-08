@@ -26,7 +26,7 @@ static gboolean on_inotify(gint fd, GIOCondition condition, gpointer user_data) 
         if (n <= 0) break;
         for (size_t offset = 0; offset < (size_t)n;) {
             const struct inotify_event *e = (const void *)(buffer + offset);
-            if (e->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) {
+            if (e->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) {
                 if (!(e->mask & IN_ISDIR) && e->len && w->callback)
                     w->callback(e->name, w->user_data);
             }
@@ -43,7 +43,7 @@ AaWatcher *aa_watcher_start(const char *directory, AaWatcherEvent callback,
         g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno), "inotify_init1 failed: %s", g_strerror(errno));
         return NULL;
     }
-    int wd = inotify_add_watch(fd, directory, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF);
+    int wd = inotify_add_watch(fd, directory, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM | IN_DELETE_SELF | IN_MOVE_SELF);
     if (wd < 0) {
         g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno), "Cannot watch %s: %s", directory, g_strerror(errno));
         close(fd);
